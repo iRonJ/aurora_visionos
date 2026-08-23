@@ -17,6 +17,33 @@ function(aurora_find_package_global)
 endfunction()
 
 if (AURORA_ENABLE_GX)
+  if (NOT TARGET ZLIB::ZLIB)
+    aurora_find_package_global(ZLIB QUIET)
+  endif ()
+  if (NOT TARGET ZLIB::ZLIB)
+    message(STATUS "aurora: Fetching zlib")
+    set(ZLIB_BUILD_SHARED ${_USE_SHARED} CACHE BOOL "Enable building zlib shared library" FORCE)
+    set(ZLIB_BUILD_TESTING OFF CACHE BOOL "Enable Zlib Examples as tests" FORCE)
+    set(ZLIB_INSTALL OFF CACHE BOOL "Enable installation of zlib" FORCE)
+    FetchContent_Declare(
+      ZLIB
+      URL https://github.com/madler/zlib/releases/download/v1.3.2/zlib-1.3.2.tar.gz
+      URL_HASH SHA256=bb329a0a2cd0274d05519d61c667c062e06990d72e125ee2dfa8de64f0119d16
+      DOWNLOAD_EXTRACT_TIMESTAMP TRUE
+      EXCLUDE_FROM_ALL
+    )
+    FetchContent_MakeAvailable(ZLIB)
+    if (NOT TARGET ZLIB::ZLIB)
+      message(FATAL_ERROR "Failed to make zlib available")
+    endif ()
+    # libpng calls find_package(ZLIB) even when zlib was already provided by FetchContent.
+    file(WRITE "${CMAKE_FIND_PACKAGE_REDIRECTS_DIR}/ZLIBConfig.cmake"
+      "set(ZLIB_FOUND TRUE)\n"
+      "set(ZLIB_INCLUDE_DIR \"${zlib_SOURCE_DIR}\")\n"
+      "set(ZLIB_INCLUDE_DIRS \"${zlib_BINARY_DIR};${zlib_SOURCE_DIR}\")\n"
+    )
+  endif ()
+
   include(${CMAKE_CURRENT_SOURCE_DIR}/../cmake/AuroraDawnProvider.cmake)
 endif ()
 
@@ -90,33 +117,6 @@ else ()
 endif ()
 
 if (AURORA_ENABLE_GX)
-  if (NOT TARGET ZLIB::ZLIB)
-    aurora_find_package_global(ZLIB QUIET)
-  endif ()
-  if (NOT TARGET ZLIB::ZLIB)
-    message(STATUS "aurora: Fetching zlib")
-    set(ZLIB_BUILD_SHARED ${_USE_SHARED} CACHE BOOL "Enable building zlib shared library" FORCE)
-    set(ZLIB_BUILD_TESTING OFF CACHE BOOL "Enable Zlib Examples as tests" FORCE)
-    set(ZLIB_INSTALL OFF CACHE BOOL "Enable installation of zlib" FORCE)
-    FetchContent_Declare(
-      ZLIB
-      URL https://github.com/madler/zlib/releases/download/v1.3.2/zlib-1.3.2.tar.gz
-      URL_HASH SHA256=bb329a0a2cd0274d05519d61c667c062e06990d72e125ee2dfa8de64f0119d16
-      DOWNLOAD_EXTRACT_TIMESTAMP TRUE
-      EXCLUDE_FROM_ALL
-    )
-    FetchContent_MakeAvailable(ZLIB)
-    if (NOT TARGET ZLIB::ZLIB)
-      message(FATAL_ERROR "Failed to make zlib available")
-    endif ()
-    # libpng calls find_package(ZLIB) even when zlib was already provided by FetchContent.
-    file(WRITE "${CMAKE_FIND_PACKAGE_REDIRECTS_DIR}/ZLIBConfig.cmake"
-      "set(ZLIB_FOUND TRUE)\n"
-      "set(ZLIB_INCLUDE_DIR \"${zlib_SOURCE_DIR}\")\n"
-      "set(ZLIB_INCLUDE_DIRS \"${zlib_BINARY_DIR};${zlib_SOURCE_DIR}\")\n"
-    )
-  endif ()
-
   if (NOT TARGET PNG::PNG)
     if (TARGET png_shared AND _USE_SHARED)
       add_library(PNG::PNG ALIAS png_shared)

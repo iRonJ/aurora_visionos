@@ -26,6 +26,8 @@ namespace aurora {
 AuroraConfig g_config;
 uint32_t g_sdlCustomEventsStart;
 char g_gameName[4];
+AuroraPostRenderCallback g_postRenderCallback = nullptr;
+void* g_postRenderUserdata = nullptr;
 
 namespace {
 Module Log("aurora");
@@ -262,6 +264,9 @@ void end_frame() noexcept {
   auto encoder = g_device.CreateCommandEncoder(&encoderDescriptor);
   gfx::end_frame(encoder);
   gfx::render(encoder);
+  if (g_postRenderCallback) {
+    g_postRenderCallback(&encoder, g_postRenderUserdata);
+  }
   {
     window::SurfaceLock surfaceLock;
     if (window::is_presentable() && g_surface && g_currentView) {
@@ -388,4 +393,8 @@ void aurora_set_resampler(AuroraSampler sampler) {
 #else
   (void)sampler;
 #endif
+}
+void aurora_set_post_render_callback(AuroraPostRenderCallback callback, void* userdata) {
+  aurora::g_postRenderCallback = callback;
+  aurora::g_postRenderUserdata = userdata;
 }

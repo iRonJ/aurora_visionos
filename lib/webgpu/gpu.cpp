@@ -1018,6 +1018,15 @@ void resize_swapchain(uint32_t width, uint32_t height, uint32_t native_width, ui
   g_depthBuffer = create_depth_texture(width, height);
   g_CopyBindGroup = create_copy_bind_group(present_source());
 }
+
+wgpu::Device get_device() { return g_device; }
+wgpu::Queue get_queue() { return g_queue; }
+wgpu::TextureView get_present_source_view() { return present_source().view; }
+wgpu::TextureView get_depth_view() { return g_depthBuffer.view; }
+wgpu::Sampler get_present_sampler() { return present_source().sampler; }
+wgpu::Sampler get_depth_sampler() { return g_depthBuffer.sampler; }
+uint32_t get_present_width() { return present_source().size.width; }
+uint32_t get_present_height() { return present_source().size.height; }
 } // namespace aurora::webgpu
 
 void aurora_enable_vsync(const bool enabled) {
