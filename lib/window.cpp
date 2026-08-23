@@ -470,6 +470,12 @@ SDL_Window* get_sdl_window() { return g_window; }
 SDL_Renderer* get_sdl_renderer() { return g_renderer; }
 
 bool is_paused() noexcept {
+#if defined(TARGET_OS_VISION) && TARGET_OS_VISION
+  // The compositor owns presentation on visionOS. There is deliberately no
+  // SDL window, so treating a missing window as paused blocks forever in
+  // SDL_WaitEvent before the first headless frame can begin.
+  return false;
+#else
   if (!is_presentable()) {
     return true;
   }
@@ -483,6 +489,7 @@ bool is_paused() noexcept {
     return false;
   }
   return g_config.pauseOnFocusLost && ((flags & SDL_WINDOW_INPUT_FOCUS) == 0u || (flags & SDL_WINDOW_MINIMIZED) != 0u);
+#endif
 }
 
 bool is_presentable() noexcept {

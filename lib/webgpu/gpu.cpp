@@ -13,6 +13,10 @@
 #include <magic_enum.hpp>
 #include <webgpu/webgpu_cpp.h>
 
+#ifdef __APPLE__
+#include <TargetConditionals.h>
+#endif
+
 #include "../gfx/common.hpp"
 #include "../internal.hpp"
 #include "../window.hpp"
@@ -35,6 +39,7 @@ static Module Log("aurora::gpu");
 wgpu::Device g_device;
 wgpu::Queue g_queue;
 wgpu::Surface g_surface;
+bool g_headless = false;
 wgpu::BackendType g_backendType;
 GraphicsConfig g_graphicsConfig;
 TextureWithSampler g_frameBuffer;
@@ -714,7 +719,9 @@ bool initialize(AuroraBackend auroraBackend, bool allowCpu) {
 
   {
 #if defined(TARGET_OS_VISION) && TARGET_OS_VISION
-    /* visionOS: no SDL window or surface — rendering is offscreen */
+    /* visionOS: no SDL window or surface — rendering is offscreen and
+     * presented by the app via CompositorServices */
+    g_headless = true;
 #else
     window::SurfaceLock surfaceLock;
     if (!create_surface()) {
@@ -816,6 +823,9 @@ bool initialize(AuroraBackend auroraBackend, bool allowCpu) {
       const auto feature = supportedFeatures.features[i];
       if (feature == wgpu::FeatureName::TextureCompressionBC) {
         g_bcTexturesSupported = true;
+        requiredFeatures.push_back(feature);
+      } else if (feature == wgpu::FeatureName::SharedTextureMemoryIOSurface ||
+                 feature == wgpu::FeatureName::SharedFenceMTLSharedEvent) {
         requiredFeatures.push_back(feature);
       }
     }
@@ -965,7 +975,7 @@ bool initialize(AuroraBackend auroraBackend, bool allowCpu) {
     window::SurfaceLock surfaceLock;
     resize_swapchain(size.fb_width, size.fb_height, size.native_fb_width, size.native_fb_height, true);
   }
-#endif
+#endif /* !TARGET_OS_VISION */
   return true;
 }
 

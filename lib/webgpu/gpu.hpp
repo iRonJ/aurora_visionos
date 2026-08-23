@@ -42,6 +42,9 @@ struct Viewport {
 extern wgpu::Device g_device;
 extern wgpu::Queue g_queue;
 extern wgpu::Surface g_surface;
+/* True when initialized without a window/surface (e.g. visionOS CompositorServices).
+ * The frame loop renders normally but skips swapchain acquire/present. */
+extern bool g_headless;
 extern wgpu::BackendType g_backendType;
 extern GraphicsConfig g_graphicsConfig;
 extern TextureWithSampler g_frameBuffer;

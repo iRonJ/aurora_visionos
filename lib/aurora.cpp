@@ -203,6 +203,14 @@ const AuroraEvent* update() noexcept {
 bool begin_frame() noexcept {
   ZoneScoped;
 #ifdef AURORA_ENABLE_GX
+  if (webgpu::g_headless) {
+    /* Headless: no swapchain texture to acquire — render the frame regardless */
+    imgui::new_frame(window::get_window_size());
+    if (!gfx::begin_frame()) {
+      return false;
+    }
+    return true;
+  }
   {
     window::SurfaceLock surfaceLock;
     if (!window::is_presentable()) {
@@ -325,7 +333,7 @@ void end_frame() noexcept {
         imgui::render(pass);
         pass.End();
       }
-    } else {
+    } else if (!webgpu::g_headless) {
       Log.info("Skipping present; window not presentable");
       webgpu::release_surface();
     }
