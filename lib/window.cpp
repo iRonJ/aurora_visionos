@@ -17,6 +17,7 @@
 #include <SDL3/SDL_video.h>
 #include <SDL3/SDL_init.h>
 #include <SDL3/SDL_hints.h>
+#include <SDL3/SDL_main.h>
 #include <SDL3/SDL_stdinc.h>
 #include <SDL3/SDL_pixels.h>
 
@@ -250,7 +251,7 @@ const AuroraEvent* poll_events() {
 
 bool create_window(AuroraBackend backend) {
   SDL_WindowFlags flags = SDL_WINDOW_HIGH_PIXEL_DENSITY;
-#if TARGET_OS_IOS || TARGET_OS_TV
+#if TARGET_OS_IOS || TARGET_OS_TV || (defined(TARGET_OS_VISION) && TARGET_OS_VISION)
   flags |= SDL_WINDOW_FULLSCREEN;
 #else
   flags |= SDL_WINDOW_HIDDEN | SDL_WINDOW_RESIZABLE;
@@ -358,6 +359,7 @@ void show_window() {
 }
 
 bool initialize() {
+  SDL_SetMainReady();
   /* We don't want to initialize anything input related here, otherwise the add events will get lost to the void */
   TRY(SDL_SetHint(SDL_HINT_ORIENTATIONS, "LandscapeLeft LandscapeRight"), "Error setting {}: {}", SDL_HINT_ORIENTATIONS,
       SDL_GetError());
