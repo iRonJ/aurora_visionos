@@ -40,6 +40,14 @@ void create_context() noexcept {
 
 void initialize() noexcept {
   ZoneScoped;
+#if defined(TARGET_OS_VISION) && TARGET_OS_VISION
+  g_useSdlRenderer = false;
+  ImGui_ImplSDL3_InitForOther(nullptr);
+  ImGui_ImplWGPU_InitInfo info;
+  info.Device = webgpu::g_device.Get();
+  info.RenderTargetFormat = static_cast<WGPUTextureFormat>(webgpu::g_graphicsConfig.surfaceConfiguration.format);
+  ImGui_ImplWGPU_Init(&info);
+#else
   SDL_Renderer* renderer = window::get_sdl_renderer();
   ImGui_ImplSDL3_InitForSDLRenderer(window::get_sdl_window(), renderer);
   g_useSdlRenderer = renderer != nullptr;
@@ -51,6 +59,7 @@ void initialize() noexcept {
     info.RenderTargetFormat = static_cast<WGPUTextureFormat>(webgpu::g_graphicsConfig.surfaceConfiguration.format);
     ImGui_ImplWGPU_Init(&info);
   }
+#endif
 }
 
 void shutdown() noexcept {

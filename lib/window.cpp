@@ -386,7 +386,9 @@ bool initialize() {
   TRY(SDL_SetHint(SDL_HINT_JOYSTICK_HIDAPI_GAMECUBE_RUMBLE_BRAKE, "1"), "Error setting {}: {}",
       SDL_HINT_JOYSTICK_HIDAPI_GAMECUBE_RUMBLE_BRAKE, SDL_GetError());
 
+#if !defined(TARGET_OS_VISION) || !TARGET_OS_VISION
   TRY(SDL_DisableScreenSaver(), "Error disabling screensaver: {}", SDL_GetError());
+#endif
   if (g_config.allowJoystickBackgroundEvents) {
     TRY(SDL_SetHint(SDL_HINT_JOYSTICK_ALLOW_BACKGROUND_EVENTS, "1"), "Error setting {}: {}",
         SDL_HINT_JOYSTICK_ALLOW_BACKGROUND_EVENTS, SDL_GetError());
@@ -403,7 +405,9 @@ bool initialize_event_watch() {
 void shutdown() {
   SDL_RemoveEventWatch(lifecycle_event_watch, nullptr);
   destroy_window();
+#if !defined(TARGET_OS_VISION) || !TARGET_OS_VISION
   TRY_WARN(SDL_EnableScreenSaver(), "Error enabling screensaver: {}", SDL_GetError());
+#endif
   SDL_Quit();
 }
 
