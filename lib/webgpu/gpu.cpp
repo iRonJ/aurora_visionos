@@ -713,16 +713,24 @@ bool initialize(AuroraBackend auroraBackend, bool allowCpu) {
 #endif
 
   {
+#if defined(TARGET_OS_VISION) && TARGET_OS_VISION
+    /* visionOS: no SDL window or surface — rendering is offscreen */
+#else
     window::SurfaceLock surfaceLock;
     if (!create_surface()) {
       return false;
     }
+#endif
   }
   {
     const wgpu::RequestAdapterOptions options{
         .powerPreference = wgpu::PowerPreference::HighPerformance,
         .backendType = backend,
+#if defined(TARGET_OS_VISION) && TARGET_OS_VISION
+        .compatibleSurface = nullptr,
+#else
         .compatibleSurface = g_surface,
+#endif
     };
     const auto future = g_instance.RequestAdapter(
         &options, wgpu::CallbackMode::WaitAnyOnly,
@@ -899,6 +907,27 @@ bool initialize(AuroraBackend auroraBackend, bool allowCpu) {
   }
   g_queue = g_device.GetQueue();
 
+#if defined(TARGET_OS_VISION) && TARGET_OS_VISION
+  /* visionOS: no surface/swapchain — rendering is offscreen into framebuffers
+   * that are composited via CompositorServices */
+  const auto size = window::get_window_size();
+  g_graphicsConfig = GraphicsConfig{
+      .surfaceConfiguration =
+          wgpu::SurfaceConfiguration{
+              .format = wgpu::TextureFormat::BGRA8Unorm,
+              .usage = wgpu::TextureUsage::RenderAttachment,
+              .width = size.native_fb_width,
+              .height = size.native_fb_height,
+              .presentMode = wgpu::PresentMode::Immediate,
+          },
+      .depthFormat = wgpu::TextureFormat::Depth32Float,
+      .msaaSamples = g_config.msaa,
+      .textureAnisotropy = g_config.maxTextureAnisotropy,
+  };
+  create_copy_pipeline();
+  create_resample_pipeline();
+  resize_swapchain(size.fb_width, size.fb_height, size.native_fb_width, size.native_fb_height, true);
+#else
   const wgpu::Status status = g_surface.GetCapabilities(g_adapter, &g_surfaceCapabilities);
   if (status != wgpu::Status::Success) {
     Log.error("Failed to get surface capabilities: {}", magic_enum::enum_name(status));
@@ -936,6 +965,7 @@ bool initialize(AuroraBackend auroraBackend, bool allowCpu) {
     window::SurfaceLock surfaceLock;
     resize_swapchain(size.fb_width, size.fb_height, size.native_fb_width, size.native_fb_height, true);
   }
+#endif
   return true;
 }
 
@@ -995,7 +1025,7 @@ bool refresh_surface(bool recreate) {
 }
 
 void resize_swapchain(uint32_t width, uint32_t height, uint32_t native_width, uint32_t native_height, bool force) {
-  if (!g_surface || !g_device || width == 0 || height == 0 || native_height == 0 || native_width == 0) {
+  if (!g_device || width == 0 || height == 0 || native_height == 0 || native_width == 0) {
     return;
   }
   const bool sizeChanged = g_graphicsConfig.surfaceConfiguration.width != native_width ||
@@ -1010,9 +1040,11 @@ void resize_swapchain(uint32_t width, uint32_t height, uint32_t native_width, ui
   }
   g_graphicsConfig.surfaceConfiguration.width = native_width;
   g_graphicsConfig.surfaceConfiguration.height = native_height;
-  auto surfaceConfiguration = g_graphicsConfig.surfaceConfiguration;
-  surfaceConfiguration.device = g_device;
-  g_surface.Configure(&surfaceConfiguration);
+  if (g_surface) {
+    auto surfaceConfiguration = g_graphicsConfig.surfaceConfiguration;
+    surfaceConfiguration.device = g_device;
+    g_surface.Configure(&surfaceConfiguration);
+  }
   g_frameBuffer = create_render_texture(width, height, true);
   g_frameBufferResolved = create_render_texture(width, height, false);
   g_depthBuffer = create_depth_texture(width, height);

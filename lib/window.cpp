@@ -251,8 +251,13 @@ const AuroraEvent* poll_events() {
 }
 
 bool create_window(AuroraBackend backend) {
+#if defined(TARGET_OS_VISION) && TARGET_OS_VISION
+  /* visionOS renders offscreen via CompositorServices — no SDL window needed */
+  (void)backend;
+  return true;
+#else
   SDL_WindowFlags flags = SDL_WINDOW_HIGH_PIXEL_DENSITY;
-#if TARGET_OS_IOS || TARGET_OS_TV || (defined(TARGET_OS_VISION) && TARGET_OS_VISION)
+#if TARGET_OS_IOS || TARGET_OS_TV
   flags |= SDL_WINDOW_FULLSCREEN;
 #else
   flags |= SDL_WINDOW_HIDDEN | SDL_WINDOW_RESIZABLE;
@@ -323,6 +328,7 @@ bool create_window(AuroraBackend backend) {
   SDL_SetWindowMinimumSize(g_window, 640, 480);
   set_window_icon();
   return true;
+#endif /* !TARGET_OS_VISION */
 }
 
 bool create_renderer() {
@@ -364,7 +370,12 @@ bool initialize() {
   /* We don't want to initialize anything input related here, otherwise the add events will get lost to the void */
   TRY(SDL_SetHint(SDL_HINT_ORIENTATIONS, "LandscapeLeft LandscapeRight"), "Error setting {}: {}", SDL_HINT_ORIENTATIONS,
       SDL_GetError());
+#if defined(TARGET_OS_VISION) && TARGET_OS_VISION
+  /* visionOS uses CompositorServices, not UIKit windows. Skip SDL_INIT_VIDEO. */
+  TRY(SDL_InitSubSystem(SDL_INIT_EVENTS), "Error initializing SDL: {}", SDL_GetError());
+#else
   TRY(SDL_InitSubSystem(SDL_INIT_EVENTS | SDL_INIT_VIDEO), "Error initializing SDL: {}", SDL_GetError());
+#endif
 
 #if !defined(_WIN32) && !defined(__APPLE__)
   TRY(SDL_SetHint(SDL_HINT_VIDEO_X11_NET_WM_BYPASS_COMPOSITOR, "0"), "Error setting {}: {}",
@@ -397,6 +408,18 @@ void shutdown() {
 }
 
 AuroraWindowSize get_window_size() {
+#if defined(TARGET_OS_VISION) && TARGET_OS_VISION
+  /* No SDL window on visionOS — return fixed offscreen framebuffer size */
+  return {
+      .width = 1920,
+      .height = 1080,
+      .fb_width = 1920,
+      .fb_height = 1080,
+      .native_fb_width = 1920,
+      .native_fb_height = 1080,
+      .scale = 1.0f,
+  };
+#else
   int width = 0;
   int height = 0;
   int native_fb_w = 0;
@@ -435,6 +458,7 @@ AuroraWindowSize get_window_size() {
       .native_fb_height = static_cast<uint32_t>(native_fb_h),
       .scale = scale,
   };
+#endif
 }
 
 SDL_Window* get_sdl_window() { return g_window; }
