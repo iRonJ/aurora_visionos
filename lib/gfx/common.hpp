@@ -10,6 +10,7 @@
 #include <utility>
 
 #include <aurora/gfx.h>
+#include <aurora/gfx.hpp>
 #include <aurora/math.hpp>
 #include <dolphin/gx/GXEnum.h>
 #include <webgpu/webgpu_cpp.h>
@@ -234,7 +235,7 @@ void map_staging_buffer();
 void resolve_pass(TextureHandle texture, ClipRect rect, bool clearColor, bool clearAlpha, bool clearDepth,
                   Vec4<float> clearColorValue, float clearDepthValue, GXTexFmt resolveFormat = GX_TF_RGBA8);
 
-void begin_offscreen(uint32_t width, uint32_t height);
+void begin_offscreen(uint32_t width, uint32_t height, uint32_t tag = 0);
 void end_offscreen();
 bool is_offscreen() noexcept;
 uint32_t get_sample_count() noexcept;

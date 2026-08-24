@@ -249,7 +249,10 @@ u32 resolved_format_for_handle(const gfx::TextureHandle& handle) {
 } // namespace
 
 Vec2<uint32_t> logical_fb_size() noexcept {
-  return gfx::is_offscreen() ? gfx::get_render_target_size() : vi::configured_fb_size();
+  if (gfx::is_offscreen() && !gfx::offscreen_uses_native_logical_size()) {
+    return gfx::get_render_target_size();
+  }
+  return vi::configured_fb_size();
 }
 
 gfx::Viewport map_logical_viewport(const gfx::Viewport& logicalViewport) noexcept {

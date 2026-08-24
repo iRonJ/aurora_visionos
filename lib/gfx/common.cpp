@@ -5,6 +5,7 @@
 #include "../internal.hpp"
 #include "../webgpu/gpu.hpp"
 #include "../gx/pipeline.hpp"
+#include "../gx/fifo.hpp"
 #include "pipeline_cache.hpp"
 #include "tex_copy_conv.hpp"
 #include "tex_palette_conv.hpp"
@@ -151,11 +152,19 @@ struct RenderPass {
 static std::vector<RenderPass> g_renderPasses;
 static u32 g_currentRenderPass = UINT32_MAX;
 static bool g_inOffscreen = false;
+static bool g_offscreenUsesNativeLogicalSize = false;
 static std::optional<RenderPass> g_suspendedEfbPass;
 static Viewport g_suspendedEfbViewport;
 static ClipRect g_suspendedEfbScissor;
 static webgpu::TextureWithSampler g_offscreenColor;
 static webgpu::TextureWithSampler g_offscreenDepth;
+struct SuspendedOffscreen {
+  webgpu::TextureWithSampler color;
+  webgpu::TextureWithSampler depth;
+  Viewport viewport;
+  ClipRect scissor;
+};
+static std::vector<SuspendedOffscreen> g_suspendedOffscreenPasses;
 
 static void set_efb_targets(RenderPass& pass) {
   pass.colorView = webgpu::g_frameBuffer.view;
@@ -173,11 +182,14 @@ static void set_efb_targets(RenderPass& pass) {
 struct OffscreenCacheKey {
   uint32_t width;
   uint32_t height;
+  uint32_t tag;
 
-  bool operator==(const OffscreenCacheKey& rhs) const { return width == rhs.width && height == rhs.height; }
+  bool operator==(const OffscreenCacheKey& rhs) const {
+    return width == rhs.width && height == rhs.height && tag == rhs.tag;
+  }
   template <typename H>
   friend H AbslHashValue(H h, const OffscreenCacheKey& key) {
-    return H::combine(std::move(h), key.width, key.height);
+    return H::combine(std::move(h), key.width, key.height, key.tag);
   }
 };
 struct OffscreenCacheEntry {
@@ -329,8 +341,8 @@ void clear_caches() noexcept {
   g_cachedBindGroups.clear();
 }
 
-static OffscreenCacheEntry get_offscreen_textures(uint32_t width, uint32_t height) {
-  OffscreenCacheKey key{width, height};
+static OffscreenCacheEntry get_offscreen_textures(uint32_t width, uint32_t height, uint32_t tag) {
+  OffscreenCacheKey key{width, height, tag};
   if (const auto it = g_offscreenCache.find(key); it != g_offscreenCache.end()) {
     return it->second;
   }
@@ -357,7 +369,7 @@ static OffscreenCacheEntry get_offscreen_textures(uint32_t width, uint32_t heigh
   const auto depthFormat = webgpu::g_graphicsConfig.depthFormat;
   const wgpu::TextureDescriptor depthDesc{
       .label = "Offscreen Depth",
-      .usage = wgpu::TextureUsage::RenderAttachment,
+      .usage = wgpu::TextureUsage::RenderAttachment | wgpu::TextureUsage::TextureBinding,
       .dimension = wgpu::TextureDimension::e2D,
       .size = size,
       .format = depthFormat,
@@ -380,7 +392,7 @@ static OffscreenCacheEntry get_offscreen_textures(uint32_t width, uint32_t heigh
   return insertIt->second;
 }
 
-void begin_offscreen(uint32_t width, uint32_t height) {
+void begin_offscreen(uint32_t width, uint32_t height, uint32_t tag) {
   ZoneScoped;
   CHECK(g_currentRenderPass != UINT32_MAX, "begin_offscreen called outside of a frame");
 
@@ -395,10 +407,17 @@ void begin_offscreen(uint32_t width, uint32_t height) {
     }
     g_suspendedEfbViewport = g_cachedViewport;
     g_suspendedEfbScissor = g_cachedScissor;
+  } else {
+    g_suspendedOffscreenPasses.push_back({
+        .color = g_offscreenColor,
+        .depth = g_offscreenDepth,
+        .viewport = g_cachedViewport,
+        .scissor = g_cachedScissor,
+    });
   }
 
   // Create offscreen textures
-  auto offscreenEntry = get_offscreen_textures(width, height);
+  auto offscreenEntry = get_offscreen_textures(width, height, tag);
   g_offscreenColor = std::move(offscreenEntry.color);
   g_offscreenDepth = std::move(offscreenEntry.depth);
 
@@ -431,9 +450,36 @@ void end_offscreen() {
   ZoneScoped;
   CHECK(g_inOffscreen, "end_offscreen called without begin_offscreen");
 
-  g_inOffscreen = false;
   g_offscreenColor = {};
   g_offscreenDepth = {};
+
+  if (!g_suspendedOffscreenPasses.empty()) {
+    auto suspended = std::move(g_suspendedOffscreenPasses.back());
+    g_suspendedOffscreenPasses.pop_back();
+    g_offscreenColor = std::move(suspended.color);
+    g_offscreenDepth = std::move(suspended.depth);
+
+    RenderPass pass{
+        .colorView = g_offscreenColor.view,
+        .depthView = g_offscreenDepth.view,
+        .copySourceTexture = g_offscreenColor.texture,
+        .copySourceView = g_offscreenColor.view,
+        .copySourceDepthView = g_offscreenDepth.view,
+        .targetSize = g_offscreenColor.size,
+        .msaaSamples = 1,
+        .clearColor = false,
+        .clearDepth = false,
+    };
+    g_renderPasses.emplace_back(std::move(pass));
+    ++g_currentRenderPass;
+    g_cachedViewport = suspended.viewport;
+    g_cachedScissor = suspended.scissor;
+    push_command(CommandType::SetViewport, Command::Data{.setViewport = g_cachedViewport});
+    push_command(CommandType::SetScissor, Command::Data{.setScissor = g_cachedScissor});
+    return;
+  }
+
+  g_inOffscreen = false;
 
   // Resume suspended EFB pass, or start a new one (load existing content)
   if (g_suspendedEfbPass) {
@@ -451,6 +497,42 @@ void end_offscreen() {
   g_cachedScissor = g_suspendedEfbScissor;
   push_command(CommandType::SetViewport, Command::Data{.setViewport = g_cachedViewport});
   push_command(CommandType::SetScissor, Command::Data{.setScissor = g_cachedScissor});
+}
+
+bool begin_capture(uint32_t width, uint32_t height, uint32_t tag) {
+  if (width == 0 || height == 0 || g_currentRenderPass == UINT32_MAX || g_inOffscreen) {
+    return false;
+  }
+  gx::fifo::drain();
+  begin_offscreen(width, height, tag);
+  return true;
+}
+
+bool end_capture(CapturedFrame& frame) {
+  frame = {};
+  if (!g_inOffscreen) {
+    return false;
+  }
+
+  gx::fifo::drain();
+  frame.colorTexture = g_offscreenColor.texture;
+  frame.colorView = g_offscreenColor.view;
+  frame.depthTexture = g_offscreenDepth.texture;
+  frame.depthView = g_offscreenDepth.view;
+  frame.width = g_offscreenColor.size.width;
+  frame.height = g_offscreenColor.size.height;
+  end_offscreen();
+  return frame.colorTexture && frame.colorView;
+}
+
+void set_offscreen_uses_native_logical_size(bool enabled) noexcept {
+  g_offscreenUsesNativeLogicalSize = enabled;
+}
+
+bool offscreen_uses_native_logical_size() noexcept {
+  // A stereo eye capture represents the native EFB, but offscreen effects
+  // nested inside it still use their own logical dimensions.
+  return g_offscreenUsesNativeLogicalSize && g_suspendedOffscreenPasses.empty();
 }
 
 template <>
@@ -607,11 +689,13 @@ void shutdown() {
   g_offscreenCache.clear();
   g_offscreenColor = {};
   g_offscreenDepth = {};
+  g_suspendedOffscreenPasses.clear();
   g_staticBindGroup = {};
   g_staticBindGroupLayout = {};
   g_uniformBindGroup = {};
   g_uniformBindGroupLayout = {};
   g_inOffscreen = false;
+  g_offscreenUsesNativeLogicalSize = false;
   g_frameIndex = UINT32_MAX;
   currentStagingBuffer = 0;
   s_mappingState.store(BufferMapState::Unmapped, std::memory_order_release);
