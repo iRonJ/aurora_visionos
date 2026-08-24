@@ -147,6 +147,9 @@ struct RenderPass {
   CommandList commands;
   bool clearColor = true;
   bool clearDepth = true;
+  // The pass writes a texture returned to an external caller. It must run
+  // even when a later pass resumes the EFB and makes this pass non-final.
+  bool externallyConsumed = false;
   std::vector<tex_palette_conv::ConvRequest> paletteConvs;
 };
 static std::vector<RenderPass> g_renderPasses;
@@ -408,6 +411,10 @@ void begin_offscreen(uint32_t width, uint32_t height, uint32_t tag) {
     g_suspendedEfbViewport = g_cachedViewport;
     g_suspendedEfbScissor = g_cachedScissor;
   } else {
+    // The nested pass will later resume this offscreen attachment with a
+    // load operation. Its current contents are therefore observable even
+    // without a GXCopyTex resolve target.
+    g_renderPasses[g_currentRenderPass].externallyConsumed = true;
     g_suspendedOffscreenPasses.push_back({
         .color = g_offscreenColor,
         .depth = g_offscreenDepth,
@@ -515,6 +522,7 @@ bool end_capture(CapturedFrame& frame) {
   }
 
   gx::fifo::drain();
+  g_renderPasses[g_currentRenderPass].externallyConsumed = true;
   frame.colorTexture = g_offscreenColor.texture;
   frame.colorView = g_offscreenColor.view;
   frame.depthTexture = g_offscreenDepth.texture;
@@ -851,8 +859,8 @@ void render(wgpu::CommandEncoder& cmd) {
     }
     if (i == g_renderPasses.size() - 1) {
       ASSERT(!passInfo.resolveTarget, "Final render pass must not have resolve target");
-    } else if (!passInfo.resolveTarget) {
-      // Skip intermediate render passes without resolve target
+    } else if (!passInfo.resolveTarget && !passInfo.externallyConsumed) {
+      // Skip intermediate render passes whose attachment is unobservable.
       continue;
     }
 
