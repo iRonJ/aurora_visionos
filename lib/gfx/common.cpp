@@ -168,6 +168,13 @@ struct SuspendedOffscreen {
   ClipRect scissor;
 };
 static std::vector<SuspendedOffscreen> g_suspendedOffscreenPasses;
+struct CaptureState {
+  bool active = false;
+  size_t baseDepth = 0;
+  webgpu::TextureWithSampler color;
+  webgpu::TextureWithSampler depth;
+};
+static CaptureState g_captureState;
 
 static void set_efb_targets(RenderPass& pass) {
   pass.colorView = webgpu::g_frameBuffer.view;
@@ -507,29 +514,63 @@ void end_offscreen() {
 }
 
 bool begin_capture(uint32_t width, uint32_t height, uint32_t tag) {
-  if (width == 0 || height == 0 || g_currentRenderPass == UINT32_MAX || g_inOffscreen) {
+  if (width == 0 || height == 0 || g_currentRenderPass == UINT32_MAX || g_inOffscreen || g_captureState.active) {
     return false;
   }
   gx::fifo::drain();
+  const size_t baseDepth = g_suspendedOffscreenPasses.size();
   begin_offscreen(width, height, tag);
+  g_captureState = {
+      .active = true,
+      .baseDepth = baseDepth,
+      .color = g_offscreenColor,
+      .depth = g_offscreenDepth,
+  };
   return true;
 }
 
 bool end_capture(CapturedFrame& frame) {
   frame = {};
-  if (!g_inOffscreen) {
+  if (!g_captureState.active) {
     return false;
   }
 
   gx::fifo::drain();
+
+  // GX effects may temporarily nest their own framebuffer inside a capture.
+  // Always return to the eye target before exporting it; otherwise a leaked
+  // nested pass leaves the capture active and end_frame must abort.
+  const size_t nestedDepth = g_suspendedOffscreenPasses.size();
+  if (!g_inOffscreen) {
+    Log.warn("Capture framebuffer was closed unexpectedly");
+    g_captureState = {};
+    return false;
+  }
+  if (nestedDepth < g_captureState.baseDepth) {
+    Log.warn("Capture framebuffer nesting underflowed; closing active passes");
+    while (g_inOffscreen) {
+      end_offscreen();
+    }
+    g_captureState = {};
+    return false;
+  }
+  if (nestedDepth > g_captureState.baseDepth) {
+    Log.warn("Recovering {} unfinished framebuffer pass(es) at capture boundary",
+             nestedDepth - g_captureState.baseDepth);
+    while (g_suspendedOffscreenPasses.size() > g_captureState.baseDepth) {
+      end_offscreen();
+    }
+  }
+
   g_renderPasses[g_currentRenderPass].externallyConsumed = true;
-  frame.colorTexture = g_offscreenColor.texture;
-  frame.colorView = g_offscreenColor.view;
-  frame.depthTexture = g_offscreenDepth.texture;
-  frame.depthView = g_offscreenDepth.view;
-  frame.width = g_offscreenColor.size.width;
-  frame.height = g_offscreenColor.size.height;
+  frame.colorTexture = g_captureState.color.texture;
+  frame.colorView = g_captureState.color.view;
+  frame.depthTexture = g_captureState.depth.texture;
+  frame.depthView = g_captureState.depth.view;
+  frame.width = g_captureState.color.size.width;
+  frame.height = g_captureState.color.size.height;
   end_offscreen();
+  g_captureState = {};
   return frame.colorTexture && frame.colorView;
 }
 
@@ -698,6 +739,7 @@ void shutdown() {
   g_offscreenColor = {};
   g_offscreenDepth = {};
   g_suspendedOffscreenPasses.clear();
+  g_captureState = {};
   g_staticBindGroup = {};
   g_staticBindGroupLayout = {};
   g_uniformBindGroup = {};
