@@ -554,12 +554,25 @@ bool end_capture(CapturedFrame& frame) {
     g_captureState = {};
     return false;
   }
-  if (nestedDepth > g_captureState.baseDepth) {
-    Log.warn("Recovering {} unfinished framebuffer pass(es) at capture boundary",
-             nestedDepth - g_captureState.baseDepth);
+  const bool recoveredNestedPass = nestedDepth > g_captureState.baseDepth;
+  if (recoveredNestedPass) {
+    Log.warn("Recovering {} unfinished framebuffer pass(es) at capture boundary "
+             "(active {}x{}, capture {}x{})",
+             nestedDepth - g_captureState.baseDepth,
+             g_offscreenColor.size.width, g_offscreenColor.size.height,
+             g_captureState.color.size.width, g_captureState.color.size.height);
     while (g_suspendedOffscreenPasses.size() > g_captureState.baseDepth) {
       end_offscreen();
     }
+  }
+
+  // A nested effect that did not close cannot be guaranteed to have copied
+  // its result back into the eye target. Unwind it so the next frame starts
+  // cleanly, but reject this capture instead of exporting a partial frame.
+  if (recoveredNestedPass) {
+    end_offscreen();
+    g_captureState = {};
+    return false;
   }
 
   g_renderPasses[g_currentRenderPass].externallyConsumed = true;
@@ -825,6 +838,15 @@ bool begin_frame() {
 
 void end_frame(const wgpu::CommandEncoder& cmd) {
   ZoneScoped;
+  if (g_inOffscreen) {
+    Log.warn("Recovering {} unfinished framebuffer pass(es) at frame boundary (active {}x{})",
+             g_suspendedOffscreenPasses.size() + 1,
+             g_offscreenColor.size.width, g_offscreenColor.size.height);
+    while (g_inOffscreen) {
+      end_offscreen();
+    }
+    g_captureState = {};
+  }
   ASSERT(!g_inOffscreen, "end_frame called while offscreen rendering is active");
   g_uniforms.append_zeroes(gx::MaxUniformSize); // Pad the end of the buffer
   uint64_t bufferOffset = 0;

@@ -413,14 +413,15 @@ void shutdown() {
 
 AuroraWindowSize get_window_size() {
 #if defined(TARGET_OS_VISION) && TARGET_OS_VISION
-  /* No SDL window on visionOS — return fixed offscreen framebuffer size */
+  /* Supersample the headless stereo targets before the compositor projects
+   * them into a physically smaller or more distant diorama window. */
   return {
-      .width = 1920,
-      .height = 1080,
-      .fb_width = 1920,
-      .fb_height = 1080,
-      .native_fb_width = 1920,
-      .native_fb_height = 1080,
+      .width = 2560,
+      .height = 1440,
+      .fb_width = 2560,
+      .fb_height = 1440,
+      .native_fb_width = 2560,
+      .native_fb_height = 1440,
       .scale = 1.0f,
   };
 #else
