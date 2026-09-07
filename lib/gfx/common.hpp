@@ -17,6 +17,10 @@
 #define XXH_STATIC_LINKING_ONLY
 #include <xxhash.h>
 
+#if defined(__APPLE__)
+#include <TargetConditionals.h>
+#endif
+
 namespace aurora {
 #if INTPTR_MAX == INT32_MAX
 using HashType = XXH32_hash_t;
@@ -94,6 +98,8 @@ public:
   [[nodiscard]] uint8_t* data() noexcept { return m_data; }
   [[nodiscard]] const uint8_t* data() const noexcept { return m_data; }
   [[nodiscard]] size_t size() const noexcept { return m_length; }
+  [[nodiscard]] size_t capacity() const noexcept { return m_capacity; }
+  [[nodiscard]] bool ownsStorage() const noexcept { return m_owned; }
   [[nodiscard]] bool empty() const noexcept { return m_length == 0; }
 
   void append(const void* data, size_t size) {
@@ -174,7 +180,14 @@ namespace aurora::gfx {
 inline constexpr bool UseTextureBuffer = false;
 inline constexpr uint64_t UniformBufferSize = 25165824;  // 24mb
 inline constexpr uint64_t VertexBufferSize = 3145728;    // 3mb
+#if defined(TARGET_OS_VISION) && TARGET_OS_VISION
+// A visionOS presentation frame records two complete GX scene draws. Complex
+// areas can exceed the single-view index arena even when every individual draw
+// is valid. Actual GPU copies remain limited to the bytes written this frame.
+inline constexpr uint64_t IndexBufferSize = 4194304;     // 4mb
+#else
 inline constexpr uint64_t IndexBufferSize = 1048576;     // 1mb
+#endif
 inline constexpr uint64_t StorageBufferSize = 8388608;   // 8mb
 inline constexpr uint64_t TextureUploadSize = 25165824;  // 24mb
 

@@ -1109,7 +1109,8 @@ bool bind_pipeline(PipelineRef ref, const wgpu::RenderPassEncoder& pass) {
   return true;
 }
 
-static inline Range push(ByteBuffer& target, const uint8_t* data, size_t length, size_t alignment) {
+static inline Range push(ByteBuffer& target, const uint8_t* data, size_t length,
+                         size_t alignment, std::string_view label) {
   size_t padding = 0;
   if (alignment != 0) {
     const size_t remainder = length % alignment;
@@ -1118,6 +1119,12 @@ static inline Range push(ByteBuffer& target, const uint8_t* data, size_t length,
     }
   }
   auto begin = target.size();
+  const size_t appendSize = (length == 0 ? alignment : length) + padding;
+  if (!target.ownsStorage() &&
+      (begin > target.capacity() || appendSize > target.capacity() - begin)) {
+    Log.fatal("{} transient buffer exhausted: used={} append={} capacity={}",
+              label, begin, appendSize, target.capacity());
+  }
   if (length == 0) {
     length = alignment;
     target.append_zeroes(alignment);
@@ -1144,13 +1151,17 @@ static inline Range map(ByteBuffer& target, size_t length, size_t alignment) {
   target.append_zeroes(length + padding);
   return {static_cast<uint32_t>(begin), static_cast<uint32_t>(length + padding)};
 }
-Range push_verts(const uint8_t* data, size_t length) { return push(g_verts, data, length, 0); }
-Range push_indices(const uint8_t* data, size_t length) { return push(g_indices, data, length, 0); }
+Range push_verts(const uint8_t* data, size_t length) {
+  return push(g_verts, data, length, 0, "Vertex");
+}
+Range push_indices(const uint8_t* data, size_t length) {
+  return push(g_indices, data, length, 0, "Index");
+}
 Range push_uniform(const uint8_t* data, size_t length) {
-  return push(g_uniforms, data, length, g_cachedLimits.minUniformBufferOffsetAlignment);
+  return push(g_uniforms, data, length, g_cachedLimits.minUniformBufferOffsetAlignment, "Uniform");
 }
 Range push_storage(const uint8_t* data, size_t length) {
-  return push(g_storage, data, length, g_cachedLimits.minStorageBufferOffsetAlignment);
+  return push(g_storage, data, length, g_cachedLimits.minStorageBufferOffsetAlignment, "Storage");
 }
 Range push_texture_data(const uint8_t* data, size_t length, u32 bytesPerRow, u32 rowsPerImage) {
   // For CopyBufferToTexture, we need an alignment of 256 per row (see Dawn kTextureBytesPerRowAlignment)
