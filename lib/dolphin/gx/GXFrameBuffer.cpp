@@ -199,44 +199,6 @@ void GXCopyTex(void* dest, GXBool clear) {
   g_gxState.copyTextures[dest] = handle;
 }
 
-void GXSetCustomCopyTextureRGBA8(const void* dest, u32 width, u32 height, const void* rgbaPixels) {
-  if (dest == nullptr || rgbaPixels == nullptr || width == 0 || height == 0) {
-    return;
-  }
-
-  const aurora::gx::GXState::CopyTextureKey key{
-      .dest = const_cast<void*>(dest),
-      .width = width,
-      .height = height,
-      .format = GX_TF_RGBA8,
-  };
-
-  auto it = g_gxState.copyTextureCache.find(key);
-  if (it == g_gxState.copyTextureCache.end()) {
-    auto handle = aurora::gfx::new_render_texture(width, height, GX_TF_RGBA8, "Custom Water Reflection");
-    it = g_gxState.copyTextureCache.emplace(key, aurora::gx::GXState::CopyTextureRef{.handle = handle, .revision = 0}).first;
-  }
-
-  auto& handle = it->second;
-  const wgpu::TexelCopyTextureInfo dstView{
-      .texture = handle.handle->texture,
-      .mipLevel = 0,
-  };
-  const wgpu::TexelCopyBufferLayout dataLayout{
-      .bytesPerRow = width * 4,
-      .rowsPerImage = height,
-  };
-  const wgpu::Extent3D writeSize{
-      .width = width,
-      .height = height,
-      .depthOrArrayLayers = 1,
-  };
-  aurora::webgpu::g_queue.WriteTexture(&dstView, rgbaPixels, width * height * 4, &dataLayout, &writeSize);
-
-  ++handle.revision;
-  g_gxState.copyTextures[dest] = handle;
-}
-
 // TODO GXGetYScaleFactor
 // TODO GXGetNumXfbLines
 // TODO GXClearBoundingBox

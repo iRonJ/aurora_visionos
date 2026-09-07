@@ -124,12 +124,6 @@ void GXCreateFrameBuffer(u32 width, u32 height);
  */
 void GXRestoreFrameBuffer(void);
 
-/**
- * Populates or updates a copy texture destination with custom linear RGBA8 image data,
- * bypassing GPU framebuffer resolves.
- */
-void GXSetCustomCopyTextureRGBA8(const void* dest, u32 width, u32 height, const void* rgbaPixels);
-
 #if __cplusplus
 }
 #endif
