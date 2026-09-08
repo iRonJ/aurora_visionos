@@ -21,6 +21,7 @@
 #include <SDL3/SDL_main.h>
 #include <SDL3/SDL_stdinc.h>
 #include <SDL3/SDL_pixels.h>
+#include <tracy/Tracy.hpp>
 
 #if defined(SDL_PLATFORM_ANDROID)
 #include <jni.h>
@@ -33,11 +34,12 @@ extern "C" void Android_UnlockActivityMutex(void);
 #include <vector>
 
 #include "rmlui.hpp"
+#include "time_internal.hpp"
 #include "dolphin/vi/vi_internal.hpp"
 
 namespace aurora::window {
 namespace {
-Module Log("aurora::window");
+constexpr Module Log{"aurora::window"};
 
 SDL_Window* g_window;
 SDL_Renderer* g_renderer;
@@ -83,9 +85,6 @@ Vec2<int> fit_frame_buffer_to_aspect(int width, int height, float aspect) {
 }
 
 void resize_swapchain() noexcept {
-#if defined(SDL_PLATFORM_ANDROID)
-  SurfaceLock surfaceLock;
-#endif
   const auto size = get_window_size();
   if (size == g_windowSize) {
     return;
@@ -114,23 +113,32 @@ void set_window_icon() noexcept {
       SDL_CreateSurfaceFrom(static_cast<int>(g_config.iconWidth), static_cast<int>(g_config.iconHeight),
                             SDL_GetPixelFormatForMasks(32, 0x000000ff, 0x0000ff00, 0x00ff0000, 0xff000000),
                             g_config.iconRGBA8, static_cast<int>(4 * g_config.iconWidth));
-  ASSERT(iconSurface != nullptr, "Failed to create icon surface: {}", SDL_GetError());
+  AURORA_ASSERT(iconSurface != nullptr, "Failed to create icon surface: {}", SDL_GetError());
   TRY_WARN(SDL_SetWindowIcon(g_window, iconSurface), "Failed to set window icon: {}", SDL_GetError());
   SDL_DestroySurface(iconSurface);
 }
 
+bool targets_primary_window(const SDL_Event* event) noexcept {
+  const SDL_Window* eventWindow = SDL_GetWindowFromEvent(event);
+  return eventWindow == nullptr || eventWindow == g_window;
+}
+
 bool SDLCALL lifecycle_event_watch(void*, SDL_Event* event) {
-  switch (event->type) {
+  if (targets_primary_window(event)) {
+    switch (event->type) {
 #if defined(SDL_PLATFORM_ANDROID) || defined(SDL_PLATFORM_APPLE)
-  case SDL_EVENT_WINDOW_MINIMIZED:
-    g_backgrounded.store(true, std::memory_order_relaxed);
-    break;
-  case SDL_EVENT_WINDOW_RESTORED:
-    g_backgrounded.store(false, std::memory_order_relaxed);
-    break;
+    case SDL_EVENT_WINDOW_MINIMIZED:
+      time::internal::set_pause_reason(time::internal::PauseReason::Background, true);
+      g_backgrounded.store(true, std::memory_order_relaxed);
+      break;
+    case SDL_EVENT_WINDOW_RESTORED:
+      g_backgrounded.store(false, std::memory_order_relaxed);
+      time::internal::set_pause_reason(time::internal::PauseReason::Background, false);
+      break;
 #endif
-  default:
-    break;
+    default:
+      break;
+    }
   }
   return true;
 }
@@ -141,21 +149,28 @@ void sync_paused() {
     return;
   }
   g_lastPaused = paused;
+  time::internal::set_pause_reason(time::internal::PauseReason::Window, paused);
   g_events.push_back(AuroraEvent{
       .type = paused ? AURORA_PAUSED : AURORA_UNPAUSED,
   });
 }
 
 void process_event(SDL_Event& event) {
+  const bool primaryWindow = targets_primary_window(&event);
+  if (primaryWindow) {
 #ifdef AURORA_ENABLE_GX
-  imgui::process_event(event);
+    imgui::process_event(event);
 #endif
 #ifdef AURORA_ENABLE_RMLUI
-  rmlui::handle_event(event);
+    rmlui::handle_event(event);
 #endif
+  }
 
   switch (event.type) {
   case SDL_EVENT_WINDOW_MOVED: {
+    if (!primaryWindow) {
+      break;
+    }
     g_events.push_back(AuroraEvent{
         .type = AURORA_WINDOW_MOVED,
         .windowPos = {.x = event.window.data1, .y = event.window.data2},
@@ -163,6 +178,9 @@ void process_event(SDL_Event& event) {
     break;
   }
   case SDL_EVENT_WINDOW_DISPLAY_SCALE_CHANGED: {
+    if (!primaryWindow) {
+      break;
+    }
     resize_swapchain();
     g_events.push_back(AuroraEvent{
         .type = AURORA_DISPLAY_SCALE_CHANGED,
@@ -171,6 +189,9 @@ void process_event(SDL_Event& event) {
     break;
   }
   case SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED: {
+    if (!primaryWindow) {
+      break;
+    }
     resize_swapchain();
     g_events.push_back(AuroraEvent{
         .type = AURORA_WINDOW_RESIZED,
@@ -195,7 +216,16 @@ void process_event(SDL_Event& event) {
     break;
   }
   case SDL_EVENT_MOUSE_WHEEL:
-    input::set_mouse_scroll(event.wheel.x, event.wheel.y);
+    if (primaryWindow) {
+      input::set_mouse_scroll(event.wheel.x, event.wheel.y);
+    }
+    break;
+  case SDL_EVENT_WINDOW_CLOSE_REQUESTED:
+    if (primaryWindow) {
+      g_events.push_back(AuroraEvent{
+          .type = AURORA_EXIT,
+      });
+    }
     break;
   case SDL_EVENT_QUIT:
     g_events.push_back(AuroraEvent{
@@ -213,14 +243,15 @@ void process_event(SDL_Event& event) {
     } else if (event.type == g_sdlCustomEventsStart + CustomEvent::RefreshSurface) {
       // Refresh surface (vsync changed)
 #ifdef AURORA_ENABLE_GX
-      SurfaceLock surfaceLock;
       webgpu::refresh_surface(false);
 #endif
     }
     break;
   }
 
-  sync_paused();
+  if (primaryWindow) {
+    sync_paused();
+  }
   g_events.push_back(AuroraEvent{
       .type = AURORA_SDL_EVENT,
       .sdl = event,
@@ -229,20 +260,31 @@ void process_event(SDL_Event& event) {
 } // namespace
 
 const AuroraEvent* poll_events() {
+  ZoneScoped;
   g_events.clear();
 
   SDL_Event event;
   // Clear out the previous scroll values to prevent ghost input
   input::set_mouse_scroll(0, 0);
   if (is_paused()) {
+    ZoneScopedN("SDL_WaitEvent (paused)");
     if (SDL_WaitEvent(&event)) {
       process_event(event);
     } else {
       Log.warn("SDL_WaitEvent failed: {}", SDL_GetError());
     }
   }
-  while (SDL_PollEvent(&event)) {
-    process_event(event);
+  while (true) {
+    bool hasEvent = false;
+    {
+      ZoneScopedN("SDL_PollEvent");
+      hasEvent = SDL_PollEvent(&event);
+    }
+    if (hasEvent) {
+      process_event(event);
+    } else {
+      break;
+    }
   }
   g_events.push_back(AuroraEvent{
       .type = AURORA_NONE,
@@ -265,28 +307,6 @@ bool create_window(AuroraBackend backend) {
     flags |= SDL_WINDOW_FULLSCREEN;
   }
 #endif
-  switch (backend) {
-#ifdef AURORA_ENABLE_GX
-#ifdef DAWN_ENABLE_BACKEND_VULKAN
-  case BACKEND_VULKAN:
-    flags |= SDL_WINDOW_VULKAN;
-    break;
-#endif
-#ifdef DAWN_ENABLE_BACKEND_METAL
-  case BACKEND_METAL:
-    flags |= SDL_WINDOW_METAL;
-    break;
-#endif
-#ifdef DAWN_ENABLE_BACKEND_OPENGL
-  case BACKEND_OPENGL:
-  case BACKEND_OPENGLES:
-    flags |= SDL_WINDOW_OPENGL;
-    break;
-#endif
-#endif
-  default:
-    break;
-  }
   auto width = static_cast<Sint32>(g_config.windowWidth);
   auto height = static_cast<Sint32>(g_config.windowHeight);
   if (width == 0 || height == 0) {
@@ -320,6 +340,8 @@ bool create_window(AuroraBackend backend) {
       SDL_PROP_WINDOW_CREATE_HEIGHT_NUMBER, SDL_GetError());
   TRY(SDL_SetNumberProperty(props, SDL_PROP_WINDOW_CREATE_FLAGS_NUMBER, flags), "Failed to set {}: {}",
       SDL_PROP_WINDOW_CREATE_FLAGS_NUMBER, SDL_GetError());
+  TRY(SDL_SetBooleanProperty(props, SDL_PROP_WINDOW_CREATE_EXTERNAL_GRAPHICS_CONTEXT_BOOLEAN, backend != BACKEND_NULL),
+      "Failed to set {}: {}", SDL_PROP_WINDOW_CREATE_EXTERNAL_GRAPHICS_CONTEXT_BOOLEAN, SDL_GetError());
   g_window = SDL_CreateWindowWithProperties(props);
   if (g_window == nullptr) {
     Log.error("Failed to create window: {}", SDL_GetError());
@@ -376,6 +398,8 @@ bool initialize() {
 #else
   TRY(SDL_InitSubSystem(SDL_INIT_EVENTS | SDL_INIT_VIDEO), "Error initializing SDL: {}", SDL_GetError());
 #endif
+  time::internal::set_pause_reason(time::internal::PauseReason::Surface,
+                                   !g_surfaceReady.load(std::memory_order_acquire));
 
 #if !defined(_WIN32) && !defined(__APPLE__)
   TRY(SDL_SetHint(SDL_HINT_VIDEO_X11_NET_WM_BYPASS_COMPOSITOR, "0"), "Error setting {}: {}",
@@ -429,8 +453,8 @@ AuroraWindowSize get_window_size() {
   int height = 0;
   int native_fb_w = 0;
   int native_fb_h = 0;
-  ASSERT(SDL_GetWindowSize(g_window, &width, &height), "Failed to get window size: {}", SDL_GetError());
-  ASSERT(SDL_GetWindowSizeInPixels(g_window, &native_fb_w, &native_fb_h), "Failed to get window size in pixels: {}",
+  AURORA_ASSERT(SDL_GetWindowSize(g_window, &width, &height), "Failed to get window size: {}", SDL_GetError());
+  AURORA_ASSERT(SDL_GetWindowSizeInPixels(g_window, &native_fb_w, &native_fb_h), "Failed to get window size in pixels: {}",
          SDL_GetError());
 
   int fb_w = native_fb_w;
@@ -498,7 +522,10 @@ bool is_presentable() noexcept {
          g_surfaceReady.load(std::memory_order_acquire);
 }
 
-void set_surface_ready(bool ready) noexcept { g_surfaceReady.store(ready, std::memory_order_release); }
+void set_surface_ready(bool ready) noexcept {
+  g_surfaceReady.store(ready, std::memory_order_release);
+  time::internal::set_pause_reason(time::internal::PauseReason::Surface, !ready);
+}
 
 SurfaceLock::SurfaceLock() noexcept {
 #if defined(SDL_PLATFORM_ANDROID)
@@ -578,8 +605,8 @@ void set_background_input(bool value) { SDL_SetHint(SDL_HINT_JOYSTICK_ALLOW_BACK
 } // namespace aurora::window
 
 #if defined(SDL_PLATFORM_ANDROID)
-extern "C" JNIEXPORT void JNICALL Java_org_libsdl_app_SDLSurface_auroraNativeSetSurfaceReady(JNIEnv*, jclass,
-                                                                                             jboolean ready) {
+extern "C" JNIEXPORT void JNICALL Java_dev_encounter_aurora_AuroraSurface_nativeSetSurfaceReady(JNIEnv*, jclass,
+                                                                                                jboolean ready) {
   aurora::window::set_surface_ready(ready == JNI_TRUE);
 }
 #endif

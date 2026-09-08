@@ -1,6 +1,6 @@
 #pragma once
 
-#include "../gfx/common.hpp"
+#include "../gfx/types.hpp"
 #include "gx.hpp"
 
 namespace aurora::gx {
@@ -9,6 +9,7 @@ struct DrawData {
   gfx::Range vertRange;
   gfx::Range idxRange;
   gfx::Range uniformRange;
+  DrawImmediateData immediateData;
   uint32_t vtxCount;
   uint32_t indexCount;
   uint32_t instanceCount;
@@ -16,7 +17,7 @@ struct DrawData {
   uint32_t dstAlpha;
 };
 
-constexpr uint32_t GXPipelineConfigVersion = 11;
+constexpr uint32_t GXPipelineConfigVersion = 13;
 struct PipelineConfig {
   uint32_t version = GXPipelineConfigVersion;
   uint32_t msaaSamples = 1;
@@ -27,6 +28,9 @@ struct PipelineConfig {
   GXBlendFactor blendFacSrc, blendFacDst;
   GXLogicOp blendOp;
   uint32_t dstAlpha;
+  uint32_t polygonOffsetBits;
+  uint32_t polygonOffsetScaleBits;
+  uint32_t polygonOffsetClampBits;
   bool depthCompare, depthUpdate, alphaUpdate, colorUpdate;
 };
 static_assert(std::has_unique_object_representations_v<PipelineConfig>);

@@ -1,14 +1,18 @@
 #include "gpu.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <array>
 #include <cmath>
 #include <cstdint>
+#include <span>
+#include <string>
 #include <string_view>
 #include <utility>
 #include <vector>
 
 #include <aurora/aurora.h>
+#include <aurora/webgpu.hpp>
 #include <aurora/gfx.h>
 #include <magic_enum.hpp>
 #include <webgpu/webgpu_cpp.h>
@@ -18,11 +22,16 @@
 #endif
 
 #include "../gfx/common.hpp"
+#include "../gx/gx.hpp"
+#include "../gfx/frame.hpp"
+#include "../gfx/recording.hpp"
+#include "../gfx/render_worker.hpp"
 #include "../internal.hpp"
 #include "../window.hpp"
+#include "gpu_prof.hpp"
 
 #ifdef WEBGPU_DAWN
-#include "../dawn/BackendBinding.hpp"
+#include "../dawn/TracyPlatform.hpp"
 #include <dawn/native/DawnNative.h>
 #endif
 
@@ -49,6 +58,7 @@ TextureWithSampler g_depthBuffer;
 // EFB -> XFB copy pipeline
 static wgpu::BindGroupLayout g_CopyBindGroupLayout;
 wgpu::RenderPipeline g_CopyPipeline;
+wgpu::RenderPipeline g_CopyPremultipliedAlphaPipeline;
 wgpu::BindGroup g_CopyBindGroup;
 static AuroraSampler g_Resampler = SAMPLER_BILINEAR;
 static wgpu::BindGroupLayout g_ResampleBindGroupLayout;
@@ -58,11 +68,35 @@ static TextureWithSampler g_resampledFrameBuffer;
 
 static wgpu::Adapter g_adapter;
 wgpu::Instance g_instance;
-static wgpu::AdapterInfo g_adapterInfo;
+wgpu::AdapterInfo g_adapterInfo;
 static wgpu::SurfaceCapabilities g_surfaceCapabilities;
-bool g_bcTexturesSupported;
+bool g_hasCoreFeatures = false;
+bool g_bcTexturesSupported = false;
+bool g_astcTexturesSupported = false;
+bool g_textureComponentSwizzleSupported = false;
+static std::atomic_bool g_initialized = false;
+static std::atomic_bool g_vsyncEnabled = true;
 
 namespace {
+
+AuroraLogLevel wgpu_log_level(wgpu::LoggingType type) {
+  switch (type) {
+  case wgpu::LoggingType::Verbose:
+    return LOG_DEBUG;
+  case wgpu::LoggingType::Info:
+    return LOG_INFO;
+  case wgpu::LoggingType::Warning:
+    return LOG_WARNING;
+  case wgpu::LoggingType::Error:
+    return LOG_ERROR;
+  default:
+    return LOG_FATAL;
+  }
+}
+
+void wgpu_log(wgpu::LoggingType type, wgpu::StringView message) {
+  Log.report(wgpu_log_level(type), "WebGPU message: {}", message);
+}
 
 struct ResampleUniformBlock {
   uint32_t samplerMode = 0;
@@ -164,31 +198,6 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
 }
 )"sv;
 
-wgpu::PresentMode best_present_mode(bool vsync) {
-  const auto supports = [](const wgpu::PresentMode candidate) {
-    for (size_t i = 0; i < g_surfaceCapabilities.presentModeCount; ++i) {
-      if (g_surfaceCapabilities.presentModes[i] == candidate) {
-        return true;
-      }
-    }
-    return false;
-  };
-  if (vsync) {
-    if (supports(wgpu::PresentMode::FifoRelaxed)) {
-      return wgpu::PresentMode::FifoRelaxed;
-    }
-  } else {
-    // Dawn only disables CAMetalLayer displaySyncEnabled for Immediate on Metal
-    if (g_backendType != wgpu::BackendType::Metal && supports(wgpu::PresentMode::Mailbox)) {
-      return wgpu::PresentMode::Mailbox;
-    }
-    if (supports(wgpu::PresentMode::Immediate)) {
-      return wgpu::PresentMode::Immediate;
-    }
-  }
-  return wgpu::PresentMode::Fifo;
-}
-
 wgpu::TextureFormat to_linear(wgpu::TextureFormat format) {
   if (format == wgpu::TextureFormat::RGBA8UnormSrgb) {
     return wgpu::TextureFormat::RGBA8Unorm;
@@ -228,6 +237,33 @@ uint32_t viewport_extent(float value) noexcept {
 
 } // namespace
 
+bool vsync_enabled() noexcept { return g_vsyncEnabled.load(std::memory_order_acquire); }
+
+wgpu::PresentMode select_present_mode(const wgpu::SurfaceCapabilities& capabilities) noexcept {
+  const auto supports = [&capabilities](const wgpu::PresentMode candidate) {
+    for (size_t i = 0; i < capabilities.presentModeCount; ++i) {
+      if (capabilities.presentModes[i] == candidate) {
+        return true;
+      }
+    }
+    return false;
+  };
+  if (vsync_enabled()) {
+    if (supports(wgpu::PresentMode::FifoRelaxed)) {
+      return wgpu::PresentMode::FifoRelaxed;
+    }
+  } else {
+    // Dawn only disables CAMetalLayer displaySyncEnabled for Immediate on Metal
+    if (g_backendType != wgpu::BackendType::Metal && supports(wgpu::PresentMode::Mailbox)) {
+      return wgpu::PresentMode::Mailbox;
+    }
+    if (supports(wgpu::PresentMode::Immediate)) {
+      return wgpu::PresentMode::Immediate;
+    }
+  }
+  return wgpu::PresentMode::Fifo;
+}
+
 TextureWithSampler create_render_texture(uint32_t width, uint32_t height, bool multisampled) {
   const wgpu::Extent3D size{
       .width = width,
@@ -240,7 +276,8 @@ TextureWithSampler create_render_texture(uint32_t width, uint32_t height, bool m
     sampleCount = g_graphicsConfig.msaaSamples;
   }
   if (width == 0 || height == 0) {
-    Log.fatal("Invalid render texture size! {}x{}, multisampled {}, format {}", width, height, static_cast<uint32_t>(format), multisampled);
+    Log.fatal("Invalid render texture size! {}x{}, multisampled {}, format {}", width, height,
+              static_cast<uint32_t>(format), multisampled);
   }
   const wgpu::TextureDescriptor textureDescriptor{
       .label = "Render texture",
@@ -299,9 +336,7 @@ void set_resampler(AuroraSampler sampler) noexcept {
   }
 }
 
-AuroraSampler get_resampler() noexcept {
-  return g_Resampler;
-}
+AuroraSampler get_resampler() noexcept { return g_Resampler; }
 
 Viewport calculate_present_viewport(uint32_t surface_width, uint32_t surface_height, uint32_t content_width,
                                     uint32_t content_height) noexcept {
@@ -411,9 +446,14 @@ fn vs_main(@builtin(vertex_index) vtxIdx: u32) -> VertexOutput {
 }
 
 @fragment
-fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
+fn fs_opaque(in: VertexOutput) -> @location(0) vec4<f32> {
     let color = textureSample(efb_texture, efb_sampler, in.uv);
     return vec4(color.rgb, 1.0);
+}
+
+@fragment
+fn fs_premultiplied_alpha(in: VertexOutput) -> @location(0) vec4<f32> {
+    return textureSample(efb_texture, efb_sampler, in.uv);
 }
 )""";
   const wgpu::ShaderModuleDescriptor moduleDescriptor{
@@ -421,16 +461,6 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
       .label = "XFB Copy Module",
   };
   auto module = g_device.CreateShaderModule(&moduleDescriptor);
-  const std::array colorTargets{wgpu::ColorTargetState{
-      .format = g_graphicsConfig.surfaceConfiguration.format,
-      .writeMask = wgpu::ColorWriteMask::All,
-  }};
-  const wgpu::FragmentState fragmentState{
-      .module = module,
-      .entryPoint = "fs_main",
-      .targetCount = colorTargets.size(),
-      .targets = colorTargets.data(),
-  };
   const std::array bindGroupLayoutEntries{
       wgpu::BindGroupLayoutEntry{
           .binding = 0,
@@ -460,25 +490,59 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
       .bindGroupLayouts = &g_CopyBindGroupLayout,
   };
   auto pipelineLayout = g_device.CreatePipelineLayout(&layoutDescriptor);
-  const wgpu::RenderPipelineDescriptor pipelineDescriptor{
-      .layout = pipelineLayout,
-      .vertex =
-          wgpu::VertexState{
-              .module = module,
-              .entryPoint = "vs_main",
-          },
-      .primitive =
-          wgpu::PrimitiveState{
-              .topology = wgpu::PrimitiveTopology::TriangleList,
-          },
-      .multisample =
-          wgpu::MultisampleState{
-              .count = 1,
-              .mask = UINT32_MAX,
-          },
-      .fragment = &fragmentState,
+
+  const auto make_copy_pipeline = [&](const char* label, const char* fragmentEntryPoint,
+                                      const wgpu::BlendState* blend) {
+    const std::array colorTargets{wgpu::ColorTargetState{
+        .format = g_graphicsConfig.surfaceConfiguration.format,
+        .blend = blend,
+        .writeMask = wgpu::ColorWriteMask::All,
+    }};
+    const wgpu::FragmentState fragmentState{
+        .module = module,
+        .entryPoint = fragmentEntryPoint,
+        .targetCount = colorTargets.size(),
+        .targets = colorTargets.data(),
+    };
+    const wgpu::RenderPipelineDescriptor pipelineDescriptor{
+        .label = label,
+        .layout = pipelineLayout,
+        .vertex =
+            wgpu::VertexState{
+                .module = module,
+                .entryPoint = "vs_main",
+            },
+        .primitive =
+            wgpu::PrimitiveState{
+                .topology = wgpu::PrimitiveTopology::TriangleList,
+            },
+        .multisample =
+            wgpu::MultisampleState{
+                .count = 1,
+                .mask = UINT32_MAX,
+            },
+        .fragment = &fragmentState,
+    };
+    return g_device.CreateRenderPipeline(&pipelineDescriptor);
   };
-  g_CopyPipeline = g_device.CreateRenderPipeline(&pipelineDescriptor);
+  g_CopyPipeline = make_copy_pipeline("XFB Copy Pipeline", "fs_opaque", nullptr);
+
+  const wgpu::BlendState premultipliedAlphaBlend{
+      .color =
+          {
+              .operation = wgpu::BlendOperation::Add,
+              .srcFactor = wgpu::BlendFactor::One,
+              .dstFactor = wgpu::BlendFactor::OneMinusSrcAlpha,
+          },
+      .alpha =
+          {
+              .operation = wgpu::BlendOperation::Add,
+              .srcFactor = wgpu::BlendFactor::One,
+              .dstFactor = wgpu::BlendFactor::OneMinusSrcAlpha,
+          },
+  };
+  g_CopyPremultipliedAlphaPipeline =
+      make_copy_pipeline("XFB Premultiplied Alpha Copy Pipeline", "fs_premultiplied_alpha", &premultipliedAlphaBlend);
 }
 
 void create_resample_pipeline() {
@@ -598,6 +662,7 @@ const TextureWithSampler& resample_present_source(const wgpu::CommandEncoder& en
       .frameWidth = static_cast<float>(width),
       .frameHeight = static_cast<float>(height),
   };
+  AURORA_ASSERT(gfx::render_worker::is_worker_thread(), "Present resample queue write must run on the render worker");
   g_queue.WriteBuffer(g_ResampleUniformBuffer, 0, &uniform, sizeof(uniform));
 
   const std::array bindGroupEntries{
@@ -633,6 +698,7 @@ const TextureWithSampler& resample_present_source(const wgpu::CommandEncoder& en
       .label = "Present resample render pass",
       .colorAttachmentCount = attachments.size(),
       .colorAttachments = attachments.data(),
+      .timestampWrites = gpu_prof::pass_writes("Present resample"),
   };
   const auto pass = encoder.BeginRenderPass(&renderPassDescriptor);
   pass.SetPipeline(g_ResamplePipeline);
@@ -665,23 +731,22 @@ static wgpu::BackendType to_wgpu_backend(AuroraBackend backend) {
   }
 }
 
+static void release_surface_locked() noexcept {
+  if (g_surface) {
+    g_surface.Unconfigure();
+  }
+  g_surface = {};
+}
+
 static bool create_surface() {
   SDL_Window* window = window::get_sdl_window();
   if (window == nullptr) {
     Log.error("Failed to create surface: no window");
     return false;
   }
-  const auto chainedDescriptor = utils::SetupWindowAndGetSurfaceDescriptor(window);
-  if (!chainedDescriptor) {
-    Log.error("Failed to create surface descriptor for current window");
-    return false;
-  }
-  const wgpu::SurfaceDescriptor surfaceDescriptor{
-      .nextInChain = chainedDescriptor.get(),
-      .label = "Surface",
-  };
-  release_surface();
-  g_surface = g_instance.CreateSurface(&surfaceDescriptor);
+  window::SurfaceLock surfaceLock;
+  release_surface_locked();
+  g_surface = create_window_surface(g_instance, window, "Surface");
   if (!g_surface) {
     Log.error("Failed to create surface");
     return false;
@@ -702,6 +767,10 @@ bool initialize(AuroraBackend auroraBackend, bool allowCpu) {
 #ifdef WEBGPU_DAWN
     dawn::native::DawnInstanceDescriptor dawnInstanceDescriptor;
     dawnInstanceDescriptor.backendValidationLevel = dawn::native::BackendValidationLevel::Disabled;
+    dawnInstanceDescriptor.SetLoggingCallback(wgpu_log);
+#ifdef TRACY_ENABLE
+    dawnInstanceDescriptor.platform = tracy_dawn_platform();
+#endif
     instanceDescriptor.nextInChain = &dawnInstanceDescriptor;
 #endif
     g_instance = wgpu::CreateInstance(&instanceDescriptor);
@@ -731,6 +800,7 @@ bool initialize(AuroraBackend auroraBackend, bool allowCpu) {
   }
   {
     const wgpu::RequestAdapterOptions options{
+        .featureLevel = wgpu::FeatureLevel::Compatibility,
         .powerPreference = wgpu::PowerPreference::HighPerformance,
         .backendType = backend,
 #if defined(TARGET_OS_VISION) && TARGET_OS_VISION
@@ -739,22 +809,42 @@ bool initialize(AuroraBackend auroraBackend, bool allowCpu) {
         .compatibleSurface = g_surface,
 #endif
     };
+    Log.info("Requesting adapter\n  Feature level: {}\n  Power preference: {}\n  Backend: {}\n  Compatible surface: {}",
+             magic_enum::enum_name(options.featureLevel), magic_enum::enum_name(options.powerPreference),
+             magic_enum::enum_name(options.backendType), static_cast<bool>(options.compatibleSurface));
+    bool requestAdapterCallbackCompleted = false;
+    wgpu::RequestAdapterStatus requestAdapterStatus = wgpu::RequestAdapterStatus::CallbackCancelled;
+    std::string requestAdapterMessage;
     const auto future = g_instance.RequestAdapter(
         &options, wgpu::CallbackMode::WaitAnyOnly,
-        [](wgpu::RequestAdapterStatus status, wgpu::Adapter adapter, wgpu::StringView message) {
+        [&](wgpu::RequestAdapterStatus status, wgpu::Adapter adapter, wgpu::StringView message) {
+          requestAdapterCallbackCompleted = true;
+          requestAdapterStatus = status;
+          requestAdapterMessage = std::string{std::string_view{message}};
           if (status == wgpu::RequestAdapterStatus::Success) {
             g_adapter = std::move(adapter);
           } else {
-            Log.warn("Adapter request failed: {}", message);
+            Log.warn("Adapter request failed: {}: {}", magic_enum::enum_name(status), message);
           }
         });
     const auto status = g_instance.WaitAny(future, 5000000000);
     if (status != wgpu::WaitStatus::Success) {
-      Log.error("Failed to create adapter: {}", magic_enum::enum_name(status));
+      if (requestAdapterCallbackCompleted) {
+        Log.error("Failed to create adapter: wait status {}, request status {}, message: {}",
+                  magic_enum::enum_name(status), magic_enum::enum_name(requestAdapterStatus), requestAdapterMessage);
+      } else {
+        Log.error("Failed to create adapter: wait status {}, request callback did not complete",
+                  magic_enum::enum_name(status));
+      }
       return false;
     }
     if (!g_adapter) {
-      Log.error("Failed to create adapter");
+      if (requestAdapterCallbackCompleted) {
+        Log.error("Failed to create adapter: request status {}, message: {}",
+                  magic_enum::enum_name(requestAdapterStatus), requestAdapterMessage);
+      } else {
+        Log.error("Failed to create adapter: request callback did not complete");
+      }
       return false;
     }
   }
@@ -763,7 +853,7 @@ bool initialize(AuroraBackend auroraBackend, bool allowCpu) {
   if (adapterName.IsUndefined()) {
     adapterName = wgpu::StringView("Unknown");
   }
-  if (!allowCpu && g_adapterInfo.adapterType == wgpu::AdapterType::CPU) {
+  if (!allowCpu && g_adapterInfo.adapterType == wgpu::AdapterType::CPU && backend != wgpu::BackendType::Null) {
     Log.warn("Ignoring CPU adapter: {}", adapterName);
     g_adapterInfo = {};
     g_adapter = {};
@@ -781,7 +871,12 @@ bool initialize(AuroraBackend auroraBackend, bool allowCpu) {
   {
     wgpu::Limits supportedLimits{};
     g_adapter.GetLimits(&supportedLimits);
+    wgpu::CompatibilityModeLimits compatibilityModeLimits{wgpu::CompatibilityModeLimits::Init{
+        .maxStorageBuffersInVertexStage = 2,
+        .maxStorageBuffersInFragmentStage = 2,
+    }};
     const wgpu::Limits requiredLimits{
+        .nextInChain = &compatibilityModeLimits,
         // Use "best" supported limits
         .maxTextureDimension1D = supportedLimits.maxTextureDimension1D == 0 ? WGPU_LIMIT_U32_UNDEFINED
                                                                             : supportedLimits.maxTextureDimension1D,
@@ -791,16 +886,12 @@ bool initialize(AuroraBackend auroraBackend, bool allowCpu) {
                                                                             : supportedLimits.maxTextureDimension3D,
         .maxTextureArrayLayers = supportedLimits.maxTextureArrayLayers == 0 ? WGPU_LIMIT_U32_UNDEFINED
                                                                             : supportedLimits.maxTextureArrayLayers,
-        .maxDynamicStorageBuffersPerPipelineLayout = supportedLimits.maxDynamicStorageBuffersPerPipelineLayout == 0
-                                                         ? WGPU_LIMIT_U32_UNDEFINED
-                                                         : supportedLimits.maxDynamicStorageBuffersPerPipelineLayout,
-        .maxStorageBuffersPerShaderStage = supportedLimits.maxStorageBuffersPerShaderStage == 0
-                                               ? WGPU_LIMIT_U32_UNDEFINED
-                                               : supportedLimits.maxStorageBuffersPerShaderStage,
+        .maxStorageBuffersPerShaderStage = 2,
         .minUniformBufferOffsetAlignment =
             supportedLimits.minUniformBufferOffsetAlignment < 64 ? 64 : supportedLimits.minUniformBufferOffsetAlignment,
         .minStorageBufferOffsetAlignment =
             supportedLimits.minStorageBufferOffsetAlignment < 16 ? 16 : supportedLimits.minStorageBufferOffsetAlignment,
+        .maxImmediateSize = sizeof(gx::DrawImmediateData),
     };
     Log.info(
         "Using limits:"
@@ -808,58 +899,91 @@ bool initialize(AuroraBackend auroraBackend, bool allowCpu) {
         "\n  maxTextureDimension2D: {}"
         "\n  maxTextureDimension3D: {}"
         "\n  maxTextureArrayLayers: {}"
-        "\n  maxDynamicStorageBuffersPerPipelineLayout: {}"
         "\n  maxStorageBuffersPerShaderStage: {}"
         "\n  minUniformBufferOffsetAlignment: {}"
-        "\n  minStorageBufferOffsetAlignment: {}",
+        "\n  minStorageBufferOffsetAlignment: {}"
+        "\n  maxImmediateSize: {}",
         requiredLimits.maxTextureDimension1D, requiredLimits.maxTextureDimension2D,
         requiredLimits.maxTextureDimension3D, requiredLimits.maxTextureArrayLayers,
-        requiredLimits.maxDynamicStorageBuffersPerPipelineLayout, requiredLimits.maxStorageBuffersPerShaderStage,
-        requiredLimits.minUniformBufferOffsetAlignment, requiredLimits.minStorageBufferOffsetAlignment);
+        requiredLimits.maxStorageBuffersPerShaderStage, requiredLimits.minUniformBufferOffsetAlignment,
+        requiredLimits.minStorageBufferOffsetAlignment, requiredLimits.maxImmediateSize);
     std::vector<wgpu::FeatureName> requiredFeatures;
+    g_hasCoreFeatures = false;
+    g_bcTexturesSupported = false;
+    g_astcTexturesSupported = false;
+    g_textureComponentSwizzleSupported = false;
     wgpu::SupportedFeatures supportedFeatures;
     g_adapter.GetFeatures(&supportedFeatures);
     for (size_t i = 0; i < supportedFeatures.featureCount; ++i) {
       const auto feature = supportedFeatures.features[i];
-      if (feature == wgpu::FeatureName::TextureCompressionBC) {
-        g_bcTexturesSupported = true;
+      if (feature == wgpu::FeatureName::CoreFeaturesAndLimits || feature == wgpu::FeatureName::TextureCompressionBC ||
+          feature == wgpu::FeatureName::TextureCompressionASTC ||
+          feature == wgpu::FeatureName::TextureComponentSwizzle) {
+        if (feature == wgpu::FeatureName::CoreFeaturesAndLimits) {
+          g_hasCoreFeatures = true;
+        } else if (feature == wgpu::FeatureName::TextureCompressionBC) {
+          g_bcTexturesSupported = true;
+        } else if (feature == wgpu::FeatureName::TextureCompressionASTC) {
+          g_astcTexturesSupported = true;
+        } else if (feature == wgpu::FeatureName::TextureComponentSwizzle) {
+          g_textureComponentSwizzleSupported = true;
+        }
         requiredFeatures.push_back(feature);
       } else if (feature == wgpu::FeatureName::SharedTextureMemoryIOSurface ||
                  feature == wgpu::FeatureName::SharedFenceMTLSharedEvent) {
         requiredFeatures.push_back(feature);
       }
+#ifdef TRACY_ENABLE
+      if (feature == wgpu::FeatureName::TimestampQuery) {
+        requiredFeatures.push_back(feature);
+      }
+#endif
     }
+    std::string featureList;
+    for (auto featureName : requiredFeatures) {
+      featureList += "\n  ";
+      featureList += magic_enum::enum_name(featureName);
+    }
+    Log.info("Enabling features: {}", featureList);
 #ifdef WEBGPU_DAWN
-    wgpu::DawnCacheDeviceDescriptor cacheDescriptor({
-        .isolationKey = nullptr,
-        .loadDataFunction = load_from_cache,
-        .storeDataFunction = store_to_cache,
-        .functionUserdata = nullptr,
-    });
+    wgpu::DawnCacheDeviceDescriptor cacheDescriptor({.nextInChain = nullptr});
+    cacheDescriptor.SetDawnLoadCacheDataCallback(
+        [](std::span<const std::byte> key, std::span<std::byte> value) noexcept -> size_t {
+          return load_from_cache(key.data(), key.size(), value.data(), value.size(), nullptr);
+        });
+    cacheDescriptor.SetDawnStoreCacheDataCallback(
+        [](std::span<const std::byte> key, std::span<const std::byte> value) noexcept {
+          store_to_cache(key.data(), key.size(), value.data(), value.size(), nullptr);
+        });
 
     constexpr std::array enableToggles{
-    /* clang-format off */
 #if _WIN32
-      "use_dxc",
+        "use_dxc",
 #ifndef NDEBUG
-      "emit_hlsl_debug_symbols",
+        "emit_hlsl_debug_symbols",
 #endif
 #endif
 #ifdef NDEBUG
-      "skip_validation",
-      "disable_robustness",
+        "skip_validation",
+        "disable_robustness",
 #endif
 #ifndef ANDROID
-      "use_user_defined_labels_in_backend",
+        "use_user_defined_labels_in_backend",
 #endif
-      "disable_symbol_renaming",
-      "enable_immediate_error_handling",
-        /* clang-format on */
+        "allow_unsafe_apis",
+        "disable_symbol_renaming",
+        "enable_immediate_error_handling",
+        "gl_allow_context_on_multi_threads",
     };
-    wgpu::DawnTogglesDescriptor togglesDescriptor({
+    constexpr std::array disableToggles{
+        "timestamp_quantization",
+    };
+    wgpu::DawnTogglesDescriptor togglesDescriptor(wgpu::DawnTogglesDescriptor::Init{
         .nextInChain = &cacheDescriptor,
         .enabledToggleCount = enableToggles.size(),
         .enabledToggles = enableToggles.data(),
+        .disabledToggleCount = disableToggles.size(),
+        .disabledToggles = disableToggles.data(),
     });
 #endif
     wgpu::DeviceDescriptor deviceDescriptor({
@@ -872,11 +996,21 @@ bool initialize(AuroraBackend auroraBackend, bool allowCpu) {
     });
     deviceDescriptor.SetUncapturedErrorCallback(
         [](const wgpu::Device& device, wgpu::ErrorType type, wgpu::StringView message) {
-          FATAL("WebGPU error {}: {}", underlying(type), message);
+          if (g_initialized) {
+            FATAL("WebGPU error {}: {}", underlying(type), message);
+          } else {
+            Log.warn("WebGPU error {}: {}", underlying(type), message);
+          }
         });
-    deviceDescriptor.SetDeviceLostCallback(wgpu::CallbackMode::AllowSpontaneous,
-                                           [](const wgpu::Device& device, wgpu::DeviceLostReason reason,
-                                              wgpu::StringView message) { Log.warn("Device lost: {}", message); });
+    deviceDescriptor.SetDeviceLostCallback(
+        wgpu::CallbackMode::AllowSpontaneous,
+        [](const wgpu::Device& device, wgpu::DeviceLostReason reason, wgpu::StringView message) {
+          if (g_initialized) {
+            FATAL("Device lost: {}", message);
+          } else {
+            Log.warn("Device lost: {}", message);
+          }
+        });
     const auto future =
         g_adapter.RequestDevice(&deviceDescriptor, wgpu::CallbackMode::WaitAnyOnly,
                                 [](wgpu::RequestDeviceStatus status, wgpu::Device device, wgpu::StringView message) {
@@ -894,26 +1028,7 @@ bool initialize(AuroraBackend auroraBackend, bool allowCpu) {
     if (!g_device) {
       return false;
     }
-    g_device.SetLoggingCallback([](wgpu::LoggingType type, wgpu::StringView message) {
-      AuroraLogLevel level = LOG_FATAL;
-      switch (type) {
-      case wgpu::LoggingType::Verbose:
-        level = LOG_DEBUG;
-        break;
-      case wgpu::LoggingType::Info:
-        level = LOG_INFO;
-        break;
-      case wgpu::LoggingType::Warning:
-        level = LOG_WARNING;
-        break;
-      case wgpu::LoggingType::Error:
-        level = LOG_ERROR;
-        break;
-      default:
-        break;
-      }
-      Log.report(level, "WebGPU message: {}", message);
-    });
+    g_device.SetLoggingCallback(wgpu_log);
   }
   g_queue = g_device.GetQueue();
 
@@ -952,7 +1067,8 @@ bool initialize(AuroraBackend auroraBackend, bool allowCpu) {
     return false;
   }
   auto surfaceFormat = best_surface_format();
-  auto presentMode = best_present_mode(g_config.vsync);
+  g_vsyncEnabled.store(g_config.vsync, std::memory_order_release);
+  auto presentMode = select_present_mode(g_surfaceCapabilities);
   Log.info("Using surface format {}, present mode {}", magic_enum::enum_name(surfaceFormat),
            magic_enum::enum_name(presentMode));
   const auto size = window::get_window_size();
@@ -971,17 +1087,23 @@ bool initialize(AuroraBackend auroraBackend, bool allowCpu) {
   };
   create_copy_pipeline();
   create_resample_pipeline();
+  gpu_prof::initialize();
   {
     window::SurfaceLock surfaceLock;
     resize_swapchain(size.fb_width, size.fb_height, size.native_fb_width, size.native_fb_height, true);
   }
 #endif /* !TARGET_OS_VISION */
+  g_initialized = true;
   return true;
 }
 
 void shutdown() {
+  g_initialized = false;
+  gfx::gpu_synchronize();
+  gpu_prof::shutdown();
   g_CopyBindGroupLayout = {};
   g_CopyPipeline = {};
+  g_CopyPremultipliedAlphaPipeline = {};
   g_CopyBindGroup = {};
   g_ResampleBindGroupLayout = {};
   g_ResamplePipeline = {};
@@ -995,51 +1117,24 @@ void shutdown() {
   g_device = {};
   g_adapter = {};
   g_instance = {};
-
   cache_shutdown();
 }
 
 void release_surface() noexcept {
-  if (g_surface) {
-    g_surface.Unconfigure();
+  gfx::gpu_synchronize();
+  {
+    window::SurfaceLock surfaceLock;
+    release_surface_locked();
   }
-  g_surface = {};
 }
 
-bool refresh_surface(bool recreate) {
-  if (!g_instance || !g_device) {
-    return false;
-  }
-  if (!window::is_presentable()) {
-    release_surface();
-    return false;
-  }
-  if ((!g_surface || recreate) && !create_surface()) {
-    return false;
-  }
-  uint32_t width = g_graphicsConfig.surfaceConfiguration.width;
-  uint32_t height = g_graphicsConfig.surfaceConfiguration.height;
-  uint32_t native_width = width;
-  uint32_t native_height = height;
-  if (window::get_sdl_window() != nullptr) {
-    const auto size = window::get_window_size();
-    width = size.fb_width;
-    height = size.fb_height;
-    native_width = size.native_fb_width;
-    native_height = size.native_fb_height;
-  }
-  if (width != 0 && height != 0) {
-    resize_swapchain(width, height, native_width, native_height, true);
-  }
-  return true;
-}
-
-void resize_swapchain(uint32_t width, uint32_t height, uint32_t native_width, uint32_t native_height, bool force) {
-  if (!g_device || width == 0 || height == 0 || native_height == 0 || native_width == 0) {
+static void resize_swapchain_internal(uint32_t width, uint32_t height, uint32_t nativeWidth, uint32_t nativeHeight,
+                                      bool force) {
+  if (!g_surface || !g_device || width == 0 || height == 0 || nativeHeight == 0 || nativeWidth == 0) {
     return;
   }
-  const bool sizeChanged = g_graphicsConfig.surfaceConfiguration.width != native_width ||
-                           g_graphicsConfig.surfaceConfiguration.height != native_height ||
+  const bool sizeChanged = g_graphicsConfig.surfaceConfiguration.width != nativeWidth ||
+                           g_graphicsConfig.surfaceConfiguration.height != nativeHeight ||
                            g_frameBuffer.size.width != width || g_frameBuffer.size.height != height;
   if (!force && !sizeChanged) {
     return;
@@ -1048,11 +1143,12 @@ void resize_swapchain(uint32_t width, uint32_t height, uint32_t native_width, ui
     gx::clear_copy_texture_cache();
     gfx::clear_caches();
   }
-  g_graphicsConfig.surfaceConfiguration.width = native_width;
-  g_graphicsConfig.surfaceConfiguration.height = native_height;
-  if (g_surface) {
-    auto surfaceConfiguration = g_graphicsConfig.surfaceConfiguration;
-    surfaceConfiguration.device = g_device;
+  g_graphicsConfig.surfaceConfiguration.width = nativeWidth;
+  g_graphicsConfig.surfaceConfiguration.height = nativeHeight;
+  auto surfaceConfiguration = g_graphicsConfig.surfaceConfiguration;
+  surfaceConfiguration.device = g_device;
+  {
+    window::SurfaceLock surfaceLock;
     g_surface.Configure(&surfaceConfiguration);
   }
   g_frameBuffer = create_render_texture(width, height, true);
@@ -1069,9 +1165,48 @@ wgpu::Sampler get_present_sampler() { return present_source().sampler; }
 wgpu::Sampler get_depth_sampler() { return g_depthBuffer.sampler; }
 uint32_t get_present_width() { return present_source().size.width; }
 uint32_t get_present_height() { return present_source().size.height; }
+
+bool refresh_surface(bool recreate) {
+  gfx::gpu_synchronize();
+  if (!g_instance || !g_device) {
+    return false;
+  }
+  if (!window::is_presentable()) {
+    {
+      window::SurfaceLock surfaceLock;
+      release_surface_locked();
+    }
+    return false;
+  }
+  if ((!g_surface || recreate) && !create_surface()) {
+    return false;
+  }
+  uint32_t width = g_graphicsConfig.surfaceConfiguration.width;
+  uint32_t height = g_graphicsConfig.surfaceConfiguration.height;
+  uint32_t nativeWidth = width;
+  uint32_t nativeHeight = height;
+  if (window::get_sdl_window() != nullptr) {
+    const auto size = window::get_window_size();
+    width = size.fb_width;
+    height = size.fb_height;
+    nativeWidth = size.native_fb_width;
+    nativeHeight = size.native_fb_height;
+  }
+  if (width != 0 && height != 0) {
+    resize_swapchain_internal(width, height, nativeWidth, nativeHeight, true);
+  }
+  return true;
+}
+
+void resize_swapchain(uint32_t width, uint32_t height, uint32_t nativeWidth, uint32_t nativeHeight, bool force) {
+  gfx::gpu_synchronize();
+  resize_swapchain_internal(width, height, nativeWidth, nativeHeight, force);
+}
 } // namespace aurora::webgpu
 
 void aurora_enable_vsync(const bool enabled) {
-  aurora::webgpu::g_graphicsConfig.surfaceConfiguration.presentMode = aurora::webgpu::best_present_mode(enabled);
+  aurora::webgpu::g_vsyncEnabled.store(enabled, std::memory_order_release);
+  aurora::webgpu::g_graphicsConfig.surfaceConfiguration.presentMode =
+      aurora::webgpu::select_present_mode(aurora::webgpu::g_surfaceCapabilities);
   aurora::window::push_custom_event(aurora::window::CustomEvent::RefreshSurface);
 }

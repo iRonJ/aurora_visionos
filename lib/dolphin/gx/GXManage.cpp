@@ -2,6 +2,7 @@
 #include "__gx.h"
 
 #include "../../gx/fifo.hpp"
+#include "dolphin/gd/GDGeometry.h"
 
 #include <cstring>
 
@@ -9,10 +10,9 @@
 static __GXData_struct sGXData;
 __GXData_struct* __gx = &sGXData;
 static GXFifoObj sFifoObj;
+constexpr u32 kDrawDoneCommand = static_cast<u32>(GX_BP_REG_DRAWDONE) << 24 | 2;
 
 extern "C" {
-static GXDrawDoneCallback DrawDoneCB = nullptr;
-
 GXFifoObj* GXInit(void* base, u32 size) {
   GXRenderModeObj* rmode;
   f32 identity_mtx[3][4];
@@ -29,7 +29,6 @@ GXFifoObj* GXInit(void* base, u32 size) {
   __gx->vNum = 0;
 
   // Initialize FIFO subsystem
-  aurora::gx::fifo::init();
   GXInitFifoBase(&sFifoObj, base, size);
   GXSetCPUFifo(&sFifoObj);
   GXSetGPFifo(&sFifoObj);
@@ -71,6 +70,7 @@ GXFifoObj* GXInit(void* base, u32 size) {
   SET_REG_FIELD(0, __gx->cmode1, 8, 24, 0x42);
   SET_REG_FIELD(0, __gx->zmode, 8, 24, 0x40);
   SET_REG_FIELD(0, __gx->peCtrl, 8, 24, 0x43);
+  SET_REG_FIELD(0, __gx->cpTex, 2, 7, 0);
   SET_REG_FIELD(0, __gx->IndTexScale0, 8, 24, 0x25);
   SET_REG_FIELD(0, __gx->IndTexScale1, 8, 24, 0x26);
 
@@ -262,20 +262,18 @@ GXFifoObj* GXInit(void* base, u32 size) {
 }
 
 void GXDrawDone() {
-  if (DrawDoneCB != nullptr)
-    DrawDoneCB();
+  GXFlush();
+  GX_WRITE_RAS_REG(kDrawDoneCommand);
+  aurora::gx::fifo::drain();
 }
 
 void GXSetDrawDone() {
-  if (DrawDoneCB != nullptr)
-    DrawDoneCB();
+  GXFlush();
+  GX_WRITE_RAS_REG(kDrawDoneCommand);
+  aurora::gx::fifo::publish();
 }
 
-GXDrawDoneCallback GXSetDrawDoneCallback(GXDrawDoneCallback cb) {
-  GXDrawDoneCallback old = DrawDoneCB;
-  DrawDoneCB = cb;
-  return old;
-}
+GXDrawDoneCallback GXSetDrawDoneCallback(GXDrawDoneCallback cb) { return aurora::gx::fifo::set_draw_done_callback(cb); }
 
 void GXFlush() {
   if (__gx->dirtyState) {
