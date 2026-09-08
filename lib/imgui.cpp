@@ -92,6 +92,13 @@ void create_context() noexcept {
 
 void initialize() noexcept {
   ZoneScoped;
+#if defined(TARGET_OS_VISION) && TARGET_OS_VISION
+  g_useSdlRenderer = false;
+  ImGui_ImplWGPU_InitInfo info;
+  info.Device = webgpu::g_device.Get();
+  info.RenderTargetFormat = static_cast<WGPUTextureFormat>(webgpu::g_graphicsConfig.surfaceConfiguration.format);
+  ImGui_ImplWGPU_Init(&info);
+#else
   SDL_Renderer* renderer = window::get_sdl_renderer();
   ImGui_ImplSDL3_InitForSDLRenderer(window::get_sdl_window(), renderer);
   g_useSdlRenderer = renderer != nullptr;
@@ -103,10 +110,15 @@ void initialize() noexcept {
     info.RenderTargetFormat = static_cast<WGPUTextureFormat>(webgpu::g_graphicsConfig.surfaceConfiguration.format);
     ImGui_ImplWGPU_Init(&info);
   }
+#endif
 }
 
 void shutdown() noexcept {
   ZoneScoped;
+#if defined(TARGET_OS_VISION) && TARGET_OS_VISION
+  ImGui_ImplWGPU_Shutdown();
+  ImGui::DestroyContext();
+#else
   if (g_useSdlRenderer) {
     ImGui_ImplSDLRenderer3_Shutdown();
   } else {
@@ -114,6 +126,7 @@ void shutdown() noexcept {
   }
   ImGui_ImplSDL3_Shutdown();
   ImGui::DestroyContext();
+#endif
   for (const auto& texture : g_sdlTextures) {
     SDL_DestroyTexture(texture);
   }
@@ -122,6 +135,7 @@ void shutdown() noexcept {
 }
 
 void process_event(const SDL_Event& event) noexcept {
+#if !defined(TARGET_OS_VISION) || !TARGET_OS_VISION
   auto renderEvent = event;
   if (g_useSdlRenderer) {
     if (SDL_Renderer* renderer = window::get_sdl_renderer()) {
@@ -129,6 +143,7 @@ void process_event(const SDL_Event& event) noexcept {
     }
   }
   ImGui_ImplSDL3_ProcessEvent(&renderEvent);
+#endif
 }
 
 bool wants_capture_event(const SDL_Event& event) noexcept {
@@ -164,6 +179,18 @@ void new_frame(const AuroraWindowSize& size) noexcept {
   };
   ImVec2 displaySize{static_cast<float>(size.width), static_cast<float>(size.height)};
 
+#if defined(TARGET_OS_VISION) && TARGET_OS_VISION
+  if (g_scale != size.scale) {
+    if (g_scale > 0.f) {
+      ImGui_ImplWGPU_CreateDeviceObjects();
+    }
+    g_scale = size.scale;
+  }
+  if (!ImGui::GetIO().Fonts->IsBuilt()) {
+    ImGui_ImplWGPU_CreateDeviceObjects();
+  }
+  ImGui_ImplWGPU_NewFrame();
+#else
   if (g_useSdlRenderer) {
     if (SDL_Renderer* renderer = window::get_sdl_renderer()) {
       float renderScaleX = 1.0f;
@@ -196,6 +223,7 @@ void new_frame(const AuroraWindowSize& size) noexcept {
     ImGui_ImplWGPU_NewFrame();
   }
   ImGui_ImplSDL3_NewFrame();
+#endif
 
   ImGuiIO& io = ImGui::GetIO();
   io.DisplayFramebufferScale = framebufferScale;

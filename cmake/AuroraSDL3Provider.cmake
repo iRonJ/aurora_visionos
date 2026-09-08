@@ -151,6 +151,15 @@ elseif (_aurora_sdl3_provider STREQUAL "vendor")
       EXCLUDE_FROM_ALL
     )
     FetchContent_MakeAvailable(SDL)
+    if (APPLE AND (VISIONOS OR SIMULATOR_VISIONOS OR CMAKE_SYSTEM_NAME STREQUAL visionOS))
+      file(WRITE "${sdl_SOURCE_DIR}/include/SDL3/SDL3-Swift.h"
+"#ifdef SDL_PLATFORM_VISIONOS
+@interface SDL_uikitviewcontroller (SDLVisionOSCurvedUI)
+- (void)initializeVisionOSCurvedUI;
+@end
+#endif
+")
+    endif ()
   else ()
     message(STATUS "aurora: Using existing SDL3")
   endif ()

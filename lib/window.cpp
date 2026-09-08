@@ -17,6 +17,8 @@
 #include <SDL3/SDL_video.h>
 #include <SDL3/SDL_init.h>
 #include <SDL3/SDL_hints.h>
+#define SDL_MAIN_HANDLED
+#include <SDL3/SDL_main.h>
 #include <SDL3/SDL_stdinc.h>
 #include <SDL3/SDL_pixels.h>
 #include <tracy/Tracy.hpp>
@@ -291,6 +293,11 @@ const AuroraEvent* poll_events() {
 }
 
 bool create_window(AuroraBackend backend) {
+#if defined(TARGET_OS_VISION) && TARGET_OS_VISION
+  /* visionOS renders offscreen via CompositorServices — no SDL window needed */
+  (void)backend;
+  return true;
+#else
   SDL_WindowFlags flags = SDL_WINDOW_HIGH_PIXEL_DENSITY;
 #if TARGET_OS_IOS || TARGET_OS_TV
   flags |= SDL_WINDOW_FULLSCREEN;
@@ -343,6 +350,7 @@ bool create_window(AuroraBackend backend) {
   SDL_SetWindowMinimumSize(g_window, 640, 480);
   set_window_icon();
   return true;
+#endif /* !TARGET_OS_VISION */
 }
 
 bool create_renderer() {
@@ -380,10 +388,16 @@ void show_window() {
 }
 
 bool initialize() {
+  SDL_SetMainReady();
   /* We don't want to initialize anything input related here, otherwise the add events will get lost to the void */
   TRY(SDL_SetHint(SDL_HINT_ORIENTATIONS, "LandscapeLeft LandscapeRight"), "Error setting {}: {}", SDL_HINT_ORIENTATIONS,
       SDL_GetError());
+#if defined(TARGET_OS_VISION) && TARGET_OS_VISION
+  /* visionOS uses CompositorServices, not UIKit windows. Skip SDL_INIT_VIDEO. */
+  TRY(SDL_InitSubSystem(SDL_INIT_EVENTS), "Error initializing SDL: {}", SDL_GetError());
+#else
   TRY(SDL_InitSubSystem(SDL_INIT_EVENTS | SDL_INIT_VIDEO), "Error initializing SDL: {}", SDL_GetError());
+#endif
   time::internal::set_pause_reason(time::internal::PauseReason::Surface,
                                    !g_surfaceReady.load(std::memory_order_acquire));
 
@@ -396,7 +410,9 @@ bool initialize() {
   TRY(SDL_SetHint(SDL_HINT_JOYSTICK_HIDAPI_GAMECUBE_RUMBLE_BRAKE, "1"), "Error setting {}: {}",
       SDL_HINT_JOYSTICK_HIDAPI_GAMECUBE_RUMBLE_BRAKE, SDL_GetError());
 
+#if !defined(TARGET_OS_VISION) || !TARGET_OS_VISION
   TRY(SDL_DisableScreenSaver(), "Error disabling screensaver: {}", SDL_GetError());
+#endif
   if (g_config.allowJoystickBackgroundEvents) {
     TRY(SDL_SetHint(SDL_HINT_JOYSTICK_ALLOW_BACKGROUND_EVENTS, "1"), "Error setting {}: {}",
         SDL_HINT_JOYSTICK_ALLOW_BACKGROUND_EVENTS, SDL_GetError());
@@ -413,11 +429,26 @@ bool initialize_event_watch() {
 void shutdown() {
   SDL_RemoveEventWatch(lifecycle_event_watch, nullptr);
   destroy_window();
+#if !defined(TARGET_OS_VISION) || !TARGET_OS_VISION
   TRY_WARN(SDL_EnableScreenSaver(), "Error enabling screensaver: {}", SDL_GetError());
+#endif
   SDL_Quit();
 }
 
 AuroraWindowSize get_window_size() {
+#if defined(TARGET_OS_VISION) && TARGET_OS_VISION
+  /* Supersample the headless stereo targets before the compositor projects
+   * them into a physically smaller or more distant diorama window. */
+  return {
+      .width = 2560,
+      .height = 1440,
+      .fb_width = 2560,
+      .fb_height = 1440,
+      .native_fb_width = 2560,
+      .native_fb_height = 1440,
+      .scale = 1.0f,
+  };
+#else
   int width = 0;
   int height = 0;
   int native_fb_w = 0;
@@ -456,6 +487,7 @@ AuroraWindowSize get_window_size() {
       .native_fb_height = static_cast<uint32_t>(native_fb_h),
       .scale = scale,
   };
+#endif
 }
 
 SDL_Window* get_sdl_window() { return g_window; }
@@ -463,6 +495,12 @@ SDL_Window* get_sdl_window() { return g_window; }
 SDL_Renderer* get_sdl_renderer() { return g_renderer; }
 
 bool is_paused() noexcept {
+#if defined(TARGET_OS_VISION) && TARGET_OS_VISION
+  // The compositor owns presentation on visionOS. There is deliberately no
+  // SDL window, so treating a missing window as paused blocks forever in
+  // SDL_WaitEvent before the first headless frame can begin.
+  return false;
+#else
   if (!is_presentable()) {
     return true;
   }
@@ -476,6 +514,7 @@ bool is_paused() noexcept {
     return false;
   }
   return g_config.pauseOnFocusLost && ((flags & SDL_WINDOW_INPUT_FOCUS) == 0u || (flags & SDL_WINDOW_MINIMIZED) != 0u);
+#endif
 }
 
 bool is_presentable() noexcept {

@@ -17,6 +17,11 @@
 #include <magic_enum.hpp>
 #include <webgpu/webgpu_cpp.h>
 
+#ifdef __APPLE__
+#include <TargetConditionals.h>
+#endif
+
+#include "../gfx/common.hpp"
 #include "../gx/gx.hpp"
 #include "../gfx/frame.hpp"
 #include "../gfx/recording.hpp"
@@ -43,6 +48,7 @@ static Module Log("aurora::gpu");
 wgpu::Device g_device;
 wgpu::Queue g_queue;
 wgpu::Surface g_surface;
+bool g_headless = false;
 wgpu::BackendType g_backendType;
 GraphicsConfig g_graphicsConfig;
 TextureWithSampler g_frameBuffer;
@@ -780,15 +786,28 @@ bool initialize(AuroraBackend auroraBackend, bool allowCpu) {
   g_dawnInstance->EnableBackendValidation(backend != WGPUBackendType::D3D12);
 #endif
 
-  if (!create_surface()) {
-    return false;
+  {
+#if defined(TARGET_OS_VISION) && TARGET_OS_VISION
+    /* visionOS: no SDL window or surface — rendering is offscreen and
+     * presented by the app via CompositorServices */
+    g_headless = true;
+#else
+    window::SurfaceLock surfaceLock;
+    if (!create_surface()) {
+      return false;
+    }
+#endif
   }
   {
     const wgpu::RequestAdapterOptions options{
         .featureLevel = wgpu::FeatureLevel::Compatibility,
         .powerPreference = wgpu::PowerPreference::HighPerformance,
         .backendType = backend,
+#if defined(TARGET_OS_VISION) && TARGET_OS_VISION
+        .compatibleSurface = nullptr,
+#else
         .compatibleSurface = g_surface,
+#endif
     };
     Log.info("Requesting adapter\n  Feature level: {}\n  Power preference: {}\n  Backend: {}\n  Compatible surface: {}",
              magic_enum::enum_name(options.featureLevel), magic_enum::enum_name(options.powerPreference),
@@ -910,6 +929,9 @@ bool initialize(AuroraBackend auroraBackend, bool allowCpu) {
           g_textureComponentSwizzleSupported = true;
         }
         requiredFeatures.push_back(feature);
+      } else if (feature == wgpu::FeatureName::SharedTextureMemoryIOSurface ||
+                 feature == wgpu::FeatureName::SharedFenceMTLSharedEvent) {
+        requiredFeatures.push_back(feature);
       }
 #ifdef TRACY_ENABLE
       if (feature == wgpu::FeatureName::TimestampQuery) {
@@ -1010,6 +1032,27 @@ bool initialize(AuroraBackend auroraBackend, bool allowCpu) {
   }
   g_queue = g_device.GetQueue();
 
+#if defined(TARGET_OS_VISION) && TARGET_OS_VISION
+  /* visionOS: no surface/swapchain — rendering is offscreen into framebuffers
+   * that are composited via CompositorServices */
+  const auto size = window::get_window_size();
+  g_graphicsConfig = GraphicsConfig{
+      .surfaceConfiguration =
+          wgpu::SurfaceConfiguration{
+              .format = wgpu::TextureFormat::BGRA8Unorm,
+              .usage = wgpu::TextureUsage::RenderAttachment,
+              .width = size.native_fb_width,
+              .height = size.native_fb_height,
+              .presentMode = wgpu::PresentMode::Immediate,
+          },
+      .depthFormat = wgpu::TextureFormat::Depth32Float,
+      .msaaSamples = g_config.msaa,
+      .textureAnisotropy = g_config.maxTextureAnisotropy,
+  };
+  create_copy_pipeline();
+  create_resample_pipeline();
+  resize_swapchain(size.fb_width, size.fb_height, size.native_fb_width, size.native_fb_height, true);
+#else
   const wgpu::Status status = g_surface.GetCapabilities(g_adapter, &g_surfaceCapabilities);
   if (status != wgpu::Status::Success) {
     Log.error("Failed to get surface capabilities: {}", magic_enum::enum_name(status));
@@ -1045,7 +1088,11 @@ bool initialize(AuroraBackend auroraBackend, bool allowCpu) {
   create_copy_pipeline();
   create_resample_pipeline();
   gpu_prof::initialize();
-  resize_swapchain(size.fb_width, size.fb_height, size.native_fb_width, size.native_fb_height, true);
+  {
+    window::SurfaceLock surfaceLock;
+    resize_swapchain(size.fb_width, size.fb_height, size.native_fb_width, size.native_fb_height, true);
+  }
+#endif /* !TARGET_OS_VISION */
   g_initialized = true;
   return true;
 }
@@ -1109,6 +1156,15 @@ static void resize_swapchain_internal(uint32_t width, uint32_t height, uint32_t 
   g_depthBuffer = create_depth_texture(width, height);
   g_CopyBindGroup = create_copy_bind_group(present_source());
 }
+
+wgpu::Device get_device() { return g_device; }
+wgpu::Queue get_queue() { return g_queue; }
+wgpu::TextureView get_present_source_view() { return present_source().view; }
+wgpu::TextureView get_depth_view() { return g_depthBuffer.view; }
+wgpu::Sampler get_present_sampler() { return present_source().sampler; }
+wgpu::Sampler get_depth_sampler() { return g_depthBuffer.sampler; }
+uint32_t get_present_width() { return present_source().size.width; }
+uint32_t get_present_height() { return present_source().size.height; }
 
 bool refresh_surface(bool recreate) {
   gfx::gpu_synchronize();

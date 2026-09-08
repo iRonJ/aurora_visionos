@@ -1,6 +1,7 @@
 #pragma once
 
 #include <webgpu/webgpu_cpp.h>
+#include <cstdint>
 
 struct SDL_Window;
 
@@ -15,5 +16,16 @@ wgpu::PresentMode select_present_mode(const wgpu::SurfaceCapabilities& capabilit
 
 /// Returns the application's current vsync mode.
 bool vsync_enabled() noexcept;
+
+#ifdef AURORA_ENABLE_GX
+wgpu::Device get_device();
+wgpu::Queue get_queue();
+wgpu::TextureView get_present_source_view();
+wgpu::TextureView get_depth_view();
+wgpu::Sampler get_present_sampler();
+wgpu::Sampler get_depth_sampler();
+uint32_t get_present_width();
+uint32_t get_present_height();
+#endif
 
 } // namespace aurora::webgpu

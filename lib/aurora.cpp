@@ -35,6 +35,8 @@ namespace aurora {
 AuroraConfig g_config;
 uint32_t g_sdlCustomEventsStart;
 char g_gameName[4];
+AuroraPostRenderCallback g_postRenderCallback = nullptr;
+void* g_postRenderUserdata = nullptr;
 
 namespace {
 constexpr Module Log{"aurora"};
@@ -236,6 +238,14 @@ const AuroraEvent* update() noexcept {
 bool begin_frame() noexcept {
   ZoneScoped;
 #ifdef AURORA_ENABLE_GX
+  if (webgpu::g_headless) {
+    /* Headless: no swapchain texture to acquire — render the frame regardless */
+    imgui::new_frame(window::get_window_size());
+    if (!gfx::begin_frame()) {
+      return false;
+    }
+    return true;
+  }
   {
     if (!window::is_presentable()) {
       webgpu::release_surface();
@@ -363,11 +373,14 @@ void end_frame() noexcept {
         imgui::render(pass, imguiDrawData);
         pass.End();
       }
-    } else {
+    } else if (!webgpu::g_headless) {
       Log.info("Skipping present; window not presentable");
     }
     webgpu::gpu_prof::frame_end(encoder);
     const wgpu::CommandBufferDescriptor cmdBufDescriptor{.label = "Redraw command buffer"};
+    if (g_postRenderCallback) {
+      g_postRenderCallback(&encoder, g_postRenderUserdata);
+    }
     const auto buffer = encoder.Finish(&cmdBufDescriptor);
     {
       ZoneScopedN("Queue Submit");
@@ -473,6 +486,10 @@ void aurora_set_resampler(AuroraSampler sampler) {
 #else
   (void)sampler;
 #endif
+}
+void aurora_set_post_render_callback(AuroraPostRenderCallback callback, void* userdata) {
+  aurora::g_postRenderCallback = callback;
+  aurora::g_postRenderUserdata = userdata;
 }
 void aurora_set_timescale(float scale) { aurora::time::set_scale(scale); }
 float aurora_get_timescale() { return aurora::time::scale(); }

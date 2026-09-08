@@ -75,6 +75,7 @@ typedef struct AuroraEvent AuroraEvent;
 
 typedef void (*AuroraLogCallback)(AuroraLogLevel level, const char* module, const char* message, unsigned int len);
 typedef void (*AuroraImGuiInitCallback)(const AuroraWindowSize* size);
+typedef void (*AuroraPostRenderCallback)(void* encoder, void* userdata);
 
 #define MEM1_DEFAULT_SIZE (24 * 1024 * 1024)
 #define ARAM_DEFAULT_SIZE (16 * 1024 * 1024)
@@ -136,6 +137,7 @@ void aurora_set_log_level(AuroraLogLevel level);
 void aurora_set_pause_on_focus_lost(bool value);
 void aurora_set_background_input(bool value);
 void aurora_set_resampler(AuroraSampler sampler);
+void aurora_set_post_render_callback(AuroraPostRenderCallback callback, void* userdata);
 /** Sets the clock timescale. Default 1.0f. 0.0f is paused. Range 0.0f-16.0f. */
 void aurora_set_timescale(float scale);
 
